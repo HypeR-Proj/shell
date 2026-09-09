@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: 2026 roolrz
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "hyper-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+# Unit-test modules live in tests/ and are included by their owning library.
+autotests = false
+
+[[bin]]
+name = "hyper-shell"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+hyper-os.workspace = true
+hyper-rt.workspace = true
+hyper-service.workspace = true
+clap.workspace = true
+shlex.workspace = true
+
+[lints]
+workspace = true
