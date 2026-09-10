@@ -44,7 +44,9 @@ fn run(startup: &mut Startup<'_>) -> Result<ExitCode, Error> {
     hyper_os::require_core_abi().map_err(Error::from)?;
     let input = hyper_rt::process::stdin().map_err(Error::from)?;
     let output = hyper_rt::process::stdout().map_err(Error::from)?;
-    let error = hyper_rt::process::stderr().map_err(Error::from)?;
+    // This interactive shell presents one terminal stream. Routing diagnostics
+    // through a second session queue lets a prompt overtake pending stderr.
+    let error = output;
     let root_directory = startup.take_root_directory().map_err(Error::from)?;
     let current_directory = root_directory
         .open_directory("/", WORKING_DIRECTORY_RIGHTS)
@@ -114,8 +116,7 @@ fn run(startup: &mut Startup<'_>) -> Result<ExitCode, Error> {
                             Ok(CommandFlow::Continue) => {}
                             Ok(CommandFlow::Exit) => return Ok(ExitCode::SUCCESS),
                             Err(command_error) => {
-                                writeln!(std::io::stderr(), "sh: {command_error}")
-                                    .map_err(Error::Io)?
+                                write(output, format!("sh: {command_error}\n").as_bytes())?
                             }
                         }
                     }
@@ -175,20 +176,20 @@ fn execute_line(
         write(error, b"sh: command is not valid UTF-8\n")?;
         return Ok(CommandFlow::Continue);
     };
-    if !matches!(name, "cd" | "pwd" | "echo" | "clear" | "exit" | "help") {
+    if !matches!(name, "cd" | "pwd" | "clear" | "exit" | "help") {
         launch_command(&command, bytes, authorities, input, output, error)?;
         return Ok(CommandFlow::Continue);
     }
     let builtin = match Builtin::try_parse_from(std::iter::once("sh").chain(command.arguments())) {
         Ok(args) => args.command,
         Err(error) => {
-            error.print().map_err(Error::Io)?;
+            write(output, error.to_string().as_bytes())?;
             return Ok(CommandFlow::Continue);
         }
     };
     match builtin {
         BuiltinCommand::Help => {
-            writeln!(std::io::stdout(), "builtins: cd clear echo exit help pwd")
+            writeln!(std::io::stdout(), "builtins: cd clear exit help pwd\napps: cat echo ls ps free top handle vmm\nUse APP --help for options.")
                 .map_err(Error::Io)?
         }
         BuiltinCommand::Cd(args) => builtin_cd(&args.directory, authorities, error)?,
@@ -201,9 +202,6 @@ fn execute_line(
                 .map_err(|_| Error::InvalidCommand)?
         )
         .map_err(Error::Io)?,
-        BuiltinCommand::Echo(args) => {
-            writeln!(std::io::stdout(), "{}", args.words.join(" ")).map_err(Error::Io)?
-        }
         BuiltinCommand::Clear => std::io::stdout()
             .write_all(b"\x1b[2J\x1b[H")
             .map_err(Error::Io)?,
@@ -518,36 +516,103 @@ fn supervise_command(
     child: ChildChannels,
     shell: ShellChannels<'_>,
 ) -> Result<(), Error> {
-    let readable = ObjectSignals::<ByteChannelObject>::READABLE;
-    let shell_readable = readable.union(ObjectSignals::<ByteChannelObject>::PEER_CLOSED);
-    let terminated = ObjectSignals::<ProcessObject>::TERMINATED;
-    let waits = [
-        WaitItem::new(child.output.as_handle_ref(), readable),
-        WaitItem::new(child.error.as_handle_ref(), readable),
-        WaitItem::new(shell.input.as_handle_ref(), shell_readable),
-        WaitItem::new(process.as_handle_ref(), terminated),
-    ];
-    let mut buffer = [0_u8; channel::MAX_MESSAGE_BYTES];
-    loop {
-        let observation = wait_many(&waits, hyper_os::DEADLINE_INFINITE).map_err(Error::from)?;
-        match observation.index {
-            0 => route_message(&child.output, shell.output, &mut buffer)?,
-            1 => route_message(&child.error, shell.error, &mut buffer)?,
-            2 if ObjectSignals::<ByteChannelObject>::READABLE
-                .is_present_in(observation.observed) =>
-            {
-                route_message(shell.input, &child.input, &mut buffer)?;
-            }
-            2 => {
-                let _ = process.as_process_supervisor().request_stop();
-                return Err(Error::InputClosed);
-            }
-            3 => break,
-            _ => return Err(Error::Protocol),
-        }
+    let result = relay_command(&process, child, &shell);
+    if result.is_err() {
+        let _ = process.as_process_supervisor().request_stop();
     }
-    drain_channel(&child.output, shell.output, &mut buffer)?;
-    drain_channel(&child.error, shell.error, &mut buffer)?;
+    result
+}
+
+fn relay_command(
+    process: &OwnedHandle<ProcessObject>,
+    child: ChildChannels,
+    shell: &ShellChannels<'_>,
+) -> Result<(), Error> {
+    let mut output_buffer = vec![0; channel::MAX_MESSAGE_BYTES];
+    let mut error_buffer = vec![0; channel::MAX_MESSAGE_BYTES];
+    let mut input_buffer = vec![0; channel::MAX_MESSAGE_BYTES];
+    let mut routes = [
+        channel::ByteRelay::new(
+            child.output.as_byte_channel(),
+            shell.output.as_byte_channel(),
+            &mut output_buffer,
+        ),
+        channel::ByteRelay::new(
+            child.error.as_byte_channel(),
+            shell.error.as_byte_channel(),
+            &mut error_buffer,
+        ),
+        channel::ByteRelay::new(
+            shell.input.as_byte_channel(),
+            child.input.as_byte_channel(),
+            &mut input_buffer,
+        ),
+    ];
+    let mut terminated = false;
+    let mut output_done = [false; 2];
+    let mut input_closed = false;
+    let mut first = 0;
+    let mut waits = Vec::with_capacity(4);
+    let mut sources = Vec::with_capacity(4);
+    loop {
+        if terminated {
+            // Preserve the shell's finite drain contract: a descendant may
+            // retain an output handle after this command exits. Flush retained
+            // messages and available data, but do not wait for future output.
+            let mut progressed = false;
+            for (index, done) in output_done.iter_mut().enumerate() {
+                if *done {
+                    continue;
+                }
+                let progress = routes[index].poll().map_err(Error::from)?;
+                *done = routes[index].is_finished() || (!progress && !routes[index].has_pending());
+                progressed |= progress;
+            }
+            if output_done.iter().all(|done| *done) {
+                break;
+            }
+            if progressed {
+                continue;
+            }
+        }
+        waits.clear();
+        sources.clear();
+        // Termination wins over queued input, and output keeps draining after
+        // exit. Rotate I/O priority without blocking one direction on another.
+        if !terminated {
+            waits.push(WaitItem::new(
+                process.as_handle_ref(),
+                ObjectSignals::<ProcessObject>::TERMINATED,
+            ));
+            sources.push(3);
+        }
+        for offset in 0..routes.len() {
+            let index = (first + offset) % routes.len();
+            if (index == 2 && (terminated || input_closed)) || output_done.get(index) == Some(&true)
+            {
+                continue;
+            }
+            if let Some(item) = routes[index].wait_item() {
+                waits.push(item);
+                sources.push(index);
+            }
+        }
+        let observation = wait_many(&waits, hyper_os::DEADLINE_INFINITE).map_err(Error::from)?;
+        let index = *sources.get(observation.index).ok_or(Error::Protocol)?;
+        if index == 3 {
+            terminated = true;
+            continue;
+        }
+        match routes[index].poll() {
+            Ok(_) => {}
+            Err(OsError::Status(Status::PEER_CLOSED)) if index == 2 => input_closed = true,
+            Err(error) => return Err(Error::from(error)),
+        }
+        if index == 2 && routes[index].is_finished() {
+            return Err(Error::InputClosed);
+        }
+        first = (index + 1) % routes.len();
+    }
     let info = process
         .as_process_supervisor()
         .info()
@@ -556,36 +621,6 @@ fn supervise_command(
         write(shell.error, b"sh: command failed\n")?;
     }
     Ok(())
-}
-
-fn route_message(
-    source: &OwnedHandle<ByteChannelObject>,
-    destination: &OwnedHandle<ByteChannelObject>,
-    buffer: &mut [u8],
-) -> Result<(), Error> {
-    let count = source
-        .as_byte_channel()
-        .receive(buffer)
-        .map_err(Error::from)?;
-    write(destination, buffer.get(..count).ok_or(Error::Protocol)?)
-}
-
-fn drain_channel(
-    source: &OwnedHandle<ByteChannelObject>,
-    destination: &OwnedHandle<ByteChannelObject>,
-    buffer: &mut [u8],
-) -> Result<(), Error> {
-    loop {
-        match source.as_byte_channel().try_receive(buffer) {
-            Ok(count) => write(destination, buffer.get(..count).ok_or(Error::Protocol)?)?,
-            Err(OsError::Status(status))
-                if status == Status::WOULD_BLOCK || status == Status::PEER_CLOSED =>
-            {
-                return Ok(());
-            }
-            Err(error) => return Err(Error::from(error)),
-        }
-    }
 }
 
 fn process_succeeded(info: ProcessInfo) -> bool {

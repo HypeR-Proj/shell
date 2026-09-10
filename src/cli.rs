@@ -21,20 +21,12 @@ pub enum BuiltinCommand {
     Clear,
     Exit,
     Help,
-    #[command(disable_help_flag = true)]
-    Echo(EchoWords),
 }
 
 #[derive(Debug, Args)]
 pub struct Cd {
     #[arg(default_value = "/")]
     pub directory: String,
-}
-
-#[derive(Debug, Args)]
-pub struct EchoWords {
-    #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
-    pub words: Vec<String>,
 }
 
 #[cfg(test)]
