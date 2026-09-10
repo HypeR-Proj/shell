@@ -71,8 +71,10 @@ fn run(startup: &mut Startup<'_>) -> Result<ExitCode, Error> {
         .take(startup::MEMORY_INSPECTOR)
         .map_err(Error::from)?;
     let cpu_inspector = startup.take(startup::CPU_INSPECTOR).map_err(Error::from)?;
-    let vm_connection =
-        CapabilityChannel::from_handle(startup.take(vm::MANAGER_CONNECTION).map_err(Error::from)?);
+    let vm_connection = startup
+        .take_optional(vm::MANAGER_CONNECTION)
+        .map_err(Error::from)?
+        .map(CapabilityChannel::from_handle);
     let mut authorities = CommandAuthorities {
         root_directory,
         current_directory,
@@ -401,12 +403,15 @@ fn launch_command(
                 )
                 .map_err(|_| Error::InvalidCommand)?;
         }
-        "vmm" | "/bin/vmm" => {
+        "vmm" | "/bin/vmm" if authorities.vm_connection.is_some() => {
             let (client_control, manager_control) = channel::create_pair().map_err(Error::from)?;
             let (manager_capabilities, client_capabilities) =
                 CapabilityChannel::create().map_err(Error::from)?;
             connect_vm_manager(
-                &authorities.vm_connection,
+                authorities
+                    .vm_connection
+                    .as_ref()
+                    .ok_or(Error::InvalidCommand)?,
                 manager_control,
                 manager_capabilities,
             )?;
@@ -674,7 +679,7 @@ struct CommandAuthorities {
     object_inspector: OwnedHandle<ObjectInspectorObject>,
     memory_inspector: OwnedHandle<MemoryInspectorObject>,
     cpu_inspector: OwnedHandle<CpuInspectorObject>,
-    vm_connection: CapabilityChannel,
+    vm_connection: Option<CapabilityChannel>,
 }
 
 struct ChildChannels {
