@@ -128,9 +128,12 @@ fn run(startup: &mut Startup<'_>) -> Result<ExitCode, Error> {
                     write(output, PROMPT)?;
                 }
                 0x04 if line.is_empty() => return Ok(ExitCode::SUCCESS),
-                0x08 | 0x7f if !discard_line && !line.is_empty() => {
-                    line.pop();
-                    write(output, b"\x08 \x08")?;
+                0x08 | 0x7f => {
+                    // DEL must remain an editing key even on an empty line;
+                    // otherwise it falls through into the printable bytes.
+                    if !discard_line && line.pop().is_some() {
+                        write(output, b"\x08 \x08")?;
+                    }
                 }
                 byte if byte == b'\t' || byte >= 0x20 => {
                     if discard_line {
@@ -171,7 +174,7 @@ fn execute_line(
         return Ok(CommandFlow::Continue);
     };
     if !matches!(name, "cd" | "pwd" | "echo" | "clear" | "exit" | "help") {
-        launch_command(&command, authorities, input, output, error)?;
+        launch_command(&command, bytes, authorities, input, output, error)?;
         return Ok(CommandFlow::Continue);
     }
     let builtin = match Builtin::try_parse_from(std::iter::once("sh").chain(command.arguments())) {
@@ -237,6 +240,7 @@ fn builtin_cd(
 
 fn launch_command(
     command: &CommandLine,
+    source: &[u8],
     authorities: &CommandAuthorities,
     input: &OwnedHandle<ByteChannelObject>,
     output: &OwnedHandle<ByteChannelObject>,
@@ -245,8 +249,20 @@ fn launch_command(
     let name = command.argument(0).ok_or(Error::InvalidCommand)?;
     let executable = match open_command(authorities, name) {
         Ok(executable) => executable,
-        Err(_) => {
-            write(error, b"sh: command not found\n")?;
+        Err(open_error) => {
+            let reason = if matches!(open_error, OsError::Status(Status::NOT_FOUND)) {
+                "command not found"
+            } else {
+                "cannot open command"
+            };
+            write(
+                error,
+                format!(
+                    "sh: {reason}: {name:?} (input: \"{}\"; {open_error:?})\n",
+                    source.escape_ascii()
+                )
+                .as_bytes(),
+            )?;
             return Ok(());
         }
     };
