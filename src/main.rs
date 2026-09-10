@@ -27,6 +27,8 @@ const INPUT_CHUNK_BYTES: usize = 256;
 const READY_MESSAGE: &[u8] = b"HypeR session: console ready\n";
 const PROMPT: &[u8] = b"hyper-sh$ ";
 const WORKING_DIRECTORY_RIGHTS: DirectoryRights = DirectoryRights::READ
+    .union(DirectoryRights::WRITE)
+    .union(DirectoryRights::INSPECT)
     .union(DirectoryRights::EXECUTE)
     .union(DirectoryRights::DUPLICATE)
     .union(DirectoryRights::TRANSFER);
@@ -283,17 +285,62 @@ fn launch_command(
         .add_handle_duplicate(
             authorities.library_directory.as_handle_ref(),
             startup::DYNAMIC_LIBRARY_DIRECTORY.as_raw(),
-            RightsOffer::Exact(Rights::READ.union(Rights::EXECUTE)),
+            RightsOffer::Exact(
+                Rights::READ
+                    .union(Rights::EXECUTE)
+                    .union(Rights::DUPLICATE)
+                    .union(Rights::TRANSFER),
+            ),
         )
         .map_err(|_| Error::InvalidCommand)?;
     builder
         .add_handle_duplicate(
             authorities.current_directory.as_handle_ref(),
             process::WORKING_DIRECTORY.as_raw(),
-            RightsOffer::Exact(Rights::READ),
+            RightsOffer::Exact(WORKING_DIRECTORY_RIGHTS.as_rights()),
         )
         .map_err(|_| Error::InvalidCommand)?;
 
+    builder
+        .add_handle_duplicate(
+            authorities.root_directory.as_handle_ref(),
+            startup::ROOT_DIRECTORY.as_raw(),
+            RightsOffer::Exact(WORKING_DIRECTORY_RIGHTS.as_rights()),
+        )
+        .map_err(|_| Error::InvalidCommand)?;
+    builder
+        .add_handle_duplicate(
+            authorities.factory.as_handle_ref(),
+            startup::TASK_FACTORY.as_raw(),
+            RightsOffer::Exact(
+                Rights::CREATE_PROCESS
+                    .union(Rights::DUPLICATE)
+                    .union(Rights::TRANSFER),
+            ),
+        )
+        .map_err(|_| Error::InvalidCommand)?;
+    builder
+        .add_handle_duplicate(
+            authorities.group.as_handle_ref(),
+            startup::TASK_GROUP.as_raw(),
+            RightsOffer::Exact(
+                Rights::TASK_GROUP_ATTACH_PROCESS
+                    .union(Rights::DUPLICATE)
+                    .union(Rights::TRANSFER),
+            ),
+        )
+        .map_err(|_| Error::InvalidCommand)?;
+    builder
+        .add_handle_duplicate(
+            authorities.domain.as_handle_ref(),
+            startup::RESOURCE_DOMAIN.as_raw(),
+            RightsOffer::Exact(
+                Rights::RESOURCE_DOMAIN_SPONSOR
+                    .union(Rights::DUPLICATE)
+                    .union(Rights::TRANSFER),
+            ),
+        )
+        .map_err(|_| Error::InvalidCommand)?;
     let (parent_input, child_input) = channel::create_pair().map_err(Error::from)?;
     let (child_output, parent_output) = channel::create_pair().map_err(Error::from)?;
     let (child_error, parent_error) = channel::create_pair().map_err(Error::from)?;
@@ -450,6 +497,17 @@ fn add_child_channel(
     purpose: u32,
     rights: Rights,
 ) -> Result<(), Error> {
+    let rights = if [
+        stdio::STANDARD_INPUT.as_raw(),
+        stdio::STANDARD_OUTPUT.as_raw(),
+        stdio::STANDARD_ERROR.as_raw(),
+    ]
+    .contains(&purpose)
+    {
+        rights.union(Rights::DUPLICATE).union(Rights::TRANSFER)
+    } else {
+        rights
+    };
     builder
         .add_handle_move(channel, purpose, RightsOffer::Exact(rights))
         .map_err(|failure| Error::from(failure.error()))
