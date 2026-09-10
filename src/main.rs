@@ -28,6 +28,8 @@ const READY_MESSAGE: &[u8] = b"HypeR session: console ready\n";
 const PROMPT: &[u8] = b"hyper-sh$ ";
 const WORKING_DIRECTORY_RIGHTS: DirectoryRights = DirectoryRights::READ
     .union(DirectoryRights::WRITE)
+    .union(DirectoryRights::SET_ATTRIBUTES)
+    .union(DirectoryRights::LOCK_FILE)
     .union(DirectoryRights::INSPECT)
     .union(DirectoryRights::EXECUTE)
     .union(DirectoryRights::DUPLICATE)
