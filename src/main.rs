@@ -90,8 +90,8 @@ fn run(startup: &mut Startup<'_>) -> Result<ExitCode, Error> {
         vm_connection,
     };
 
-    write(output, READY_MESSAGE)?;
-    write(output, PROMPT)?;
+    write_terminal(READY_MESSAGE)?;
+    write_terminal(PROMPT)?;
 
     let mut line = Vec::with_capacity(MAX_LINE_BYTES);
     let mut discard_line = false;
@@ -111,35 +111,35 @@ fn run(startup: &mut Startup<'_>) -> Result<ExitCode, Error> {
             previous_was_carriage_return = byte == b'\r';
             match byte {
                 b'\r' | b'\n' => {
-                    write(output, b"\r\n")?;
+                    write_terminal(b"\r\n")?;
                     if discard_line {
-                        write(error, &[PROMPT, b"sh: command line is too long\n"].concat())?;
+                        write_terminal(&[PROMPT, b"sh: command line is too long\n"].concat())?;
                     } else if !line.is_empty() {
                         let command = line.as_slice();
                         match execute_line(command, &mut authorities, input, output, error) {
                             Ok(CommandFlow::Continue) => {}
                             Ok(CommandFlow::Exit) => return Ok(ExitCode::SUCCESS),
                             Err(command_error) => {
-                                write(output, format!("sh: {command_error}\n").as_bytes())?
+                                write_terminal(format!("sh: {command_error}\n").as_bytes())?
                             }
                         }
                     }
                     line.clear();
                     discard_line = false;
-                    write(output, PROMPT)?;
+                    write_terminal(PROMPT)?;
                 }
                 0x03 => {
                     line.clear();
                     discard_line = false;
-                    write(output, b"^C\r\n")?;
-                    write(output, PROMPT)?;
+                    write_terminal(b"^C\r\n")?;
+                    write_terminal(PROMPT)?;
                 }
                 0x04 if line.is_empty() => return Ok(ExitCode::SUCCESS),
                 0x08 | 0x7f => {
                     // DEL must remain an editing key even on an empty line;
                     // otherwise it falls through into the printable bytes.
                     if !discard_line && line.pop().is_some() {
-                        write(output, b"\x08 \x08")?;
+                        write_terminal(b"\x08 \x08")?;
                     }
                 }
                 byte if byte == b'\t' || byte >= 0x20 => {
@@ -151,7 +151,7 @@ fn run(startup: &mut Startup<'_>) -> Result<ExitCode, Error> {
                         continue;
                     }
                     line.push(byte);
-                    write(output, std::slice::from_ref(&byte))?;
+                    write_terminal(std::slice::from_ref(&byte))?;
                 }
                 _ => {}
             }
@@ -169,7 +169,7 @@ fn execute_line(
     let command = match CommandLine::parse(bytes) {
         Ok(command) => command,
         Err(_) => {
-            write(error, b"sh: invalid command syntax\n")?;
+            write_terminal(b"sh: invalid command syntax\n")?;
             return Ok(CommandFlow::Continue);
         }
     };
@@ -177,7 +177,7 @@ fn execute_line(
         return Ok(CommandFlow::Continue);
     }
     let Some(name) = command.argument(0) else {
-        write(error, b"sh: command is not valid UTF-8\n")?;
+        write_terminal(b"sh: command is not valid UTF-8\n")?;
         return Ok(CommandFlow::Continue);
     };
     if !matches!(name, "cd" | "pwd" | "clear" | "exit" | "help") {
@@ -187,7 +187,7 @@ fn execute_line(
     let builtin = match Builtin::try_parse_from(std::iter::once("sh").chain(command.arguments())) {
         Ok(args) => args.command,
         Err(error) => {
-            write(output, error.to_string().as_bytes())?;
+            write_terminal(error.to_string().as_bytes())?;
             return Ok(CommandFlow::Continue);
         }
     };
@@ -196,7 +196,7 @@ fn execute_line(
             writeln!(std::io::stdout(), "builtins: cd clear exit help pwd\napps: cat echo ls ps free top handle vmm\nUse APP --help for options.")
                 .map_err(Error::Io)?
         }
-        BuiltinCommand::Cd(args) => builtin_cd(&args.directory, authorities, error)?,
+        BuiltinCommand::Cd(args) => builtin_cd(&args.directory, authorities)?,
         BuiltinCommand::Pwd => writeln!(
             std::io::stdout(),
             "{}",
@@ -214,15 +214,11 @@ fn execute_line(
     Ok(CommandFlow::Continue)
 }
 
-fn builtin_cd(
-    target: &str,
-    authorities: &mut CommandAuthorities,
-    error: &OwnedHandle<ByteChannelObject>,
-) -> Result<(), Error> {
+fn builtin_cd(target: &str, authorities: &mut CommandAuthorities) -> Result<(), Error> {
     let path = match authorities.current_path.resolve(target) {
         Ok(path) => path,
         Err(_) => {
-            write(error, b"cd: invalid directory path\n")?;
+            write_terminal(b"cd: invalid directory path\n")?;
             return Ok(());
         }
     };
@@ -233,7 +229,7 @@ fn builtin_cd(
     {
         Ok(directory) => directory,
         Err(_) => {
-            write(error, b"cd: cannot open directory\n")?;
+            write_terminal(b"cd: cannot open directory\n")?;
             return Ok(());
         }
     };
@@ -259,8 +255,7 @@ fn launch_command(
             } else {
                 "cannot open command"
             };
-            write(
-                error,
+            write_terminal(
                 format!(
                     "sh: {reason}: {name:?} (input: \"{}\"; {open_error:?})\n",
                     source.escape_ascii()
@@ -625,7 +620,7 @@ fn relay_command(
         .info()
         .map_err(Error::from)?;
     if !process_succeeded(info) {
-        write(shell.error, b"sh: command failed\n")?;
+        write_terminal(b"sh: command failed\n")?;
     }
     Ok(())
 }
@@ -660,11 +655,11 @@ fn open_command(authorities: &CommandAuthorities, name: &str) -> Result<File, Os
         .open(&format!("/bin/{name}"), FileRights::EXECUTE)
 }
 
-fn write(destination: &OwnedHandle<ByteChannelObject>, bytes: &[u8]) -> Result<(), Error> {
-    destination
-        .as_byte_channel()
-        .send(bytes)
-        .map_err(Error::from)
+fn write_terminal(bytes: &[u8]) -> Result<(), Error> {
+    let mut output = std::io::stdout().lock();
+    output.write_all(bytes).map_err(Error::Io)?;
+    // Flush prompts and individual key echoes before the next blocking wait.
+    output.flush().map_err(Error::Io)
 }
 
 struct CommandAuthorities {
