@@ -3,22 +3,22 @@
 
 //! Initial Native command shell and capability-scoped command launcher.
 
+mod launch;
+mod route;
+use launch::launch_pipeline;
+
 use clap::Parser;
-use hyper_os::capability_channel::{CapabilityChannel, CapabilityDisposition};
-use hyper_os::channel;
-use hyper_os::fs::{Directory, DirectoryRights, File, FileRights};
+use hyper_os::Error as OsError;
+use hyper_os::capability_channel::CapabilityChannel;
+use hyper_os::fs::{Directory, DirectoryRights};
 use hyper_os::handle::{
-    ByteChannelObject, CapabilityChannelObject, CpuInspectorObject, MemoryInspectorObject,
-    ObjectInspectorObject, OwnedHandle, ProcessObject, ResourceDomainObject, Rights, RightsOffer,
-    TaskFactoryObject, TaskGroupObject, TaskInspectorObject,
+    ByteChannelObject, CpuInspectorObject, MemoryInspectorObject, ObjectInspectorObject,
+    OwnedHandle, ResourceDomainObject, TaskFactoryObject, TaskGroupObject, TaskInspectorObject,
 };
 use hyper_os::startup::{self, Startup};
-use hyper_os::task::{ProcessBuilder, ProcessInfo, ProcessTermination};
-use hyper_os::wait::{ObjectSignals, WaitItem, wait_many};
-use hyper_os::{Error as OsError, Status};
-use hyper_service::{process, stdio, vm};
+use hyper_service::{process, vm};
 use hyper_shell::cli::{Builtin, BuiltinCommand};
-use hyper_shell::command::{CommandLine, MAX_LINE_BYTES};
+use hyper_shell::command::{MAX_LINE_BYTES, Pipeline};
 use hyper_shell::path::CanonicalPath;
 use std::io::Write;
 use std::process::ExitCode;
@@ -166,22 +166,26 @@ fn execute_line(
     output: &OwnedHandle<ByteChannelObject>,
     error: &OwnedHandle<ByteChannelObject>,
 ) -> Result<CommandFlow, Error> {
-    let command = match CommandLine::parse(bytes) {
+    let pipeline = match Pipeline::parse(bytes) {
         Ok(command) => command,
         Err(_) => {
             write_terminal(b"sh: invalid command syntax\n")?;
             return Ok(CommandFlow::Continue);
         }
     };
-    if command.is_empty() {
+    let Some(stage) = pipeline.0.first() else {
         return Ok(CommandFlow::Continue);
-    }
+    };
+    let command = &stage.command;
     let Some(name) = command.argument(0) else {
         write_terminal(b"sh: command is not valid UTF-8\n")?;
         return Ok(CommandFlow::Continue);
     };
-    if !matches!(name, "cd" | "pwd" | "clear" | "exit" | "help") {
-        launch_command(&command, bytes, authorities, input, output, error)?;
+    if pipeline.0.len() > 1
+        || !stage.redirects.is_empty()
+        || !matches!(name, "cd" | "pwd" | "clear" | "exit" | "help")
+    {
+        launch_pipeline(&pipeline, bytes, authorities, input, output, error)?;
         return Ok(CommandFlow::Continue);
     }
     let builtin = match Builtin::try_parse_from(std::iter::once("sh").chain(command.arguments())) {
@@ -193,7 +197,7 @@ fn execute_line(
     };
     match builtin {
         BuiltinCommand::Help => {
-            writeln!(std::io::stdout(), "builtins: cd clear exit help pwd\napps: cat echo ls ps free top handle vmm\nUse APP --help for options.")
+            writeln!(std::io::stdout(), "builtins: cd clear exit help pwd\napps: cat grep echo ls ps free top handle vmm\nPipelines: A | B; files: < > >> 2> 2>>\nUse APP --help for options.")
                 .map_err(Error::Io)?
         }
         BuiltinCommand::Cd(args) => builtin_cd(&args.directory, authorities)?,
@@ -238,423 +242,6 @@ fn builtin_cd(target: &str, authorities: &mut CommandAuthorities) -> Result<(), 
     Ok(())
 }
 
-fn launch_command(
-    command: &CommandLine,
-    source: &[u8],
-    authorities: &CommandAuthorities,
-    input: &OwnedHandle<ByteChannelObject>,
-    output: &OwnedHandle<ByteChannelObject>,
-    error: &OwnedHandle<ByteChannelObject>,
-) -> Result<(), Error> {
-    let name = command.argument(0).ok_or(Error::InvalidCommand)?;
-    let executable = match open_command(authorities, name) {
-        Ok(executable) => executable,
-        Err(open_error) => {
-            let reason = if matches!(open_error, OsError::Status(Status::NOT_FOUND)) {
-                "command not found"
-            } else {
-                "cannot open command"
-            };
-            write_terminal(
-                format!(
-                    "sh: {reason}: {name:?} (input: \"{}\"; {open_error:?})\n",
-                    source.escape_ascii()
-                )
-                .as_bytes(),
-            )?;
-            return Ok(());
-        }
-    };
-    let builder = ProcessBuilder::create(
-        authorities.factory.as_handle_ref(),
-        authorities.group.as_handle_ref(),
-        authorities.domain.as_handle_ref(),
-        executable.as_handle_ref(),
-    )
-    .map_err(Error::from)?;
-    builder.set_name(name).map_err(Error::from)?;
-    for index in 0..command.len() {
-        builder
-            .add_argument(command.argument(index).ok_or(Error::InvalidCommand)?)
-            .map_err(Error::from)?;
-    }
-    builder
-        .add_handle_duplicate(
-            authorities.library_directory.as_handle_ref(),
-            startup::DYNAMIC_LIBRARY_DIRECTORY.as_raw(),
-            RightsOffer::Exact(
-                Rights::READ
-                    .union(Rights::EXECUTE)
-                    .union(Rights::DUPLICATE)
-                    .union(Rights::TRANSFER),
-            ),
-        )
-        .map_err(|_| Error::InvalidCommand)?;
-    builder
-        .add_handle_duplicate(
-            authorities.current_directory.as_handle_ref(),
-            process::WORKING_DIRECTORY.as_raw(),
-            RightsOffer::Exact(WORKING_DIRECTORY_RIGHTS.as_rights()),
-        )
-        .map_err(|_| Error::InvalidCommand)?;
-
-    builder
-        .add_handle_duplicate(
-            authorities.root_directory.as_handle_ref(),
-            startup::ROOT_DIRECTORY.as_raw(),
-            RightsOffer::Exact(WORKING_DIRECTORY_RIGHTS.as_rights()),
-        )
-        .map_err(|_| Error::InvalidCommand)?;
-    builder
-        .add_handle_duplicate(
-            authorities.factory.as_handle_ref(),
-            startup::TASK_FACTORY.as_raw(),
-            RightsOffer::Exact(
-                Rights::CREATE_PROCESS
-                    .union(Rights::DUPLICATE)
-                    .union(Rights::TRANSFER),
-            ),
-        )
-        .map_err(|_| Error::InvalidCommand)?;
-    builder
-        .add_handle_duplicate(
-            authorities.group.as_handle_ref(),
-            startup::TASK_GROUP.as_raw(),
-            RightsOffer::Exact(
-                Rights::TASK_GROUP_ATTACH_PROCESS
-                    .union(Rights::DUPLICATE)
-                    .union(Rights::TRANSFER),
-            ),
-        )
-        .map_err(|_| Error::InvalidCommand)?;
-    builder
-        .add_handle_duplicate(
-            authorities.domain.as_handle_ref(),
-            startup::RESOURCE_DOMAIN.as_raw(),
-            RightsOffer::Exact(
-                Rights::RESOURCE_DOMAIN_SPONSOR
-                    .union(Rights::DUPLICATE)
-                    .union(Rights::TRANSFER),
-            ),
-        )
-        .map_err(|_| Error::InvalidCommand)?;
-    let (parent_input, child_input) = channel::create_pair().map_err(Error::from)?;
-    let (child_output, parent_output) = channel::create_pair().map_err(Error::from)?;
-    let (child_error, parent_error) = channel::create_pair().map_err(Error::from)?;
-    add_child_channel(
-        &builder,
-        child_input,
-        stdio::STANDARD_INPUT.as_raw(),
-        Rights::WAIT.union(Rights::READ),
-    )?;
-    add_child_channel(
-        &builder,
-        child_output,
-        stdio::STANDARD_OUTPUT.as_raw(),
-        Rights::WAIT.union(Rights::WRITE),
-    )?;
-    match name {
-        "ps" | "/bin/ps" => builder
-            .add_handle_duplicate(
-                authorities.task_inspector.as_handle_ref(),
-                startup::TASK_INSPECTOR.as_raw(),
-                RightsOffer::Exact(Rights::INSPECT),
-            )
-            .map_err(|_| Error::InvalidCommand)?,
-        "handle" | "/bin/handle" => builder
-            .add_handle_duplicate(
-                authorities.object_inspector.as_handle_ref(),
-                startup::OBJECT_INSPECTOR.as_raw(),
-                RightsOffer::Exact(Rights::INSPECT),
-            )
-            .map_err(|_| Error::InvalidCommand)?,
-        "free" | "/bin/free" => builder
-            .add_handle_duplicate(
-                authorities.memory_inspector.as_handle_ref(),
-                startup::MEMORY_INSPECTOR.as_raw(),
-                RightsOffer::Exact(Rights::INSPECT),
-            )
-            .map_err(|_| Error::InvalidCommand)?,
-        "top" | "/bin/top" => {
-            builder
-                .add_handle_duplicate(
-                    authorities.task_inspector.as_handle_ref(),
-                    startup::TASK_INSPECTOR.as_raw(),
-                    RightsOffer::Exact(Rights::INSPECT),
-                )
-                .map_err(|_| Error::InvalidCommand)?;
-            builder
-                .add_handle_duplicate(
-                    authorities.memory_inspector.as_handle_ref(),
-                    startup::MEMORY_INSPECTOR.as_raw(),
-                    RightsOffer::Exact(Rights::INSPECT),
-                )
-                .map_err(|_| Error::InvalidCommand)?;
-            builder
-                .add_handle_duplicate(
-                    authorities.cpu_inspector.as_handle_ref(),
-                    startup::CPU_INSPECTOR.as_raw(),
-                    RightsOffer::Exact(Rights::INSPECT),
-                )
-                .map_err(|_| Error::InvalidCommand)?;
-        }
-        "vmm" | "/bin/vmm" if authorities.vm_connection.is_some() => {
-            let (client_control, manager_control) = channel::create_pair().map_err(Error::from)?;
-            let (manager_capabilities, client_capabilities) =
-                CapabilityChannel::create().map_err(Error::from)?;
-            connect_vm_manager(
-                authorities
-                    .vm_connection
-                    .as_ref()
-                    .ok_or(Error::InvalidCommand)?,
-                manager_control,
-                manager_capabilities,
-            )?;
-            add_child_channel(
-                &builder,
-                client_control,
-                vm::CLIENT_CONTROL.as_raw(),
-                vm::CLIENT_CONTROL_CONTRACT.required_rights(),
-            )?;
-            builder
-                .add_handle_move(
-                    client_capabilities.into_handle(),
-                    vm::CLIENT_CAPABILITIES.as_raw(),
-                    RightsOffer::Exact(vm::CLIENT_CAPABILITIES_CONTRACT.required_rights()),
-                )
-                .map_err(|failure| Error::from(failure.error()))?;
-        }
-        _ => {}
-    }
-    add_child_channel(
-        &builder,
-        child_error,
-        stdio::STANDARD_ERROR.as_raw(),
-        Rights::WAIT.union(Rights::WRITE),
-    )?;
-    builder.seal().map_err(Error::from)?;
-    let process = builder
-        .start()
-        .map_err(|failure| Error::from(failure.error()))?;
-    supervise_command(
-        process,
-        ChildChannels {
-            input: parent_input,
-            output: parent_output,
-            error: parent_error,
-        },
-        ShellChannels {
-            input,
-            output,
-            error,
-        },
-    )
-}
-
-fn connect_vm_manager(
-    connector: &CapabilityChannel,
-    control: OwnedHandle<ByteChannelObject>,
-    capabilities: CapabilityChannel,
-) -> Result<(), Error> {
-    let mut control = Some(control);
-    let mut capabilities = Some(capabilities.into_handle());
-    loop {
-        let waits = [WaitItem::new(
-            connector.as_handle_ref(),
-            ObjectSignals::<CapabilityChannelObject>::PEER_RECEIVING
-                .union(ObjectSignals::<CapabilityChannelObject>::PEER_CLOSED),
-        )];
-        let observation = wait_many(&waits, hyper_os::DEADLINE_INFINITE).map_err(Error::from)?;
-        if !ObjectSignals::<CapabilityChannelObject>::PEER_RECEIVING
-            .is_present_in(observation.observed)
-        {
-            return Err(Error::from(OsError::Status(Status::PEER_CLOSED)));
-        }
-        let control_disposition = CapabilityDisposition::move_handle(
-            &mut control,
-            RightsOffer::Exact(Rights::WAIT.union(Rights::READ).union(Rights::WRITE)),
-        )
-        .map_err(Error::from)?;
-        let capabilities_disposition = CapabilityDisposition::move_handle(
-            &mut capabilities,
-            RightsOffer::Exact(Rights::WAIT.union(Rights::WRITE)),
-        )
-        .map_err(Error::from)?;
-        match connector.try_send(
-            &vm::ManagerConnectionRequest.encode(),
-            &mut [control_disposition, capabilities_disposition],
-        ) {
-            Ok(()) => return Ok(()),
-            Err(OsError::Status(Status::WOULD_BLOCK)) => {}
-            Err(error) => return Err(Error::from(error)),
-        }
-    }
-}
-
-fn add_child_channel(
-    builder: &ProcessBuilder,
-    channel: OwnedHandle<ByteChannelObject>,
-    purpose: u32,
-    rights: Rights,
-) -> Result<(), Error> {
-    let rights = if [
-        stdio::STANDARD_INPUT.as_raw(),
-        stdio::STANDARD_OUTPUT.as_raw(),
-        stdio::STANDARD_ERROR.as_raw(),
-    ]
-    .contains(&purpose)
-    {
-        rights.union(Rights::DUPLICATE).union(Rights::TRANSFER)
-    } else {
-        rights
-    };
-    builder
-        .add_handle_move(channel, purpose, RightsOffer::Exact(rights))
-        .map_err(|failure| Error::from(failure.error()))
-}
-
-fn supervise_command(
-    process: OwnedHandle<ProcessObject>,
-    child: ChildChannels,
-    shell: ShellChannels<'_>,
-) -> Result<(), Error> {
-    let result = relay_command(&process, child, &shell);
-    if result.is_err() {
-        let _ = process.as_process_supervisor().request_stop();
-    }
-    result
-}
-
-fn relay_command(
-    process: &OwnedHandle<ProcessObject>,
-    child: ChildChannels,
-    shell: &ShellChannels<'_>,
-) -> Result<(), Error> {
-    let mut output_buffer = vec![0; channel::MAX_MESSAGE_BYTES];
-    let mut error_buffer = vec![0; channel::MAX_MESSAGE_BYTES];
-    let mut input_buffer = vec![0; channel::MAX_MESSAGE_BYTES];
-    let mut routes = [
-        channel::ByteRelay::new(
-            child.output.as_byte_channel(),
-            shell.output.as_byte_channel(),
-            &mut output_buffer,
-        ),
-        channel::ByteRelay::new(
-            child.error.as_byte_channel(),
-            shell.error.as_byte_channel(),
-            &mut error_buffer,
-        ),
-        channel::ByteRelay::new(
-            shell.input.as_byte_channel(),
-            child.input.as_byte_channel(),
-            &mut input_buffer,
-        ),
-    ];
-    let mut terminated = false;
-    let mut output_done = [false; 2];
-    let mut input_closed = false;
-    let mut first = 0;
-    let mut waits = Vec::with_capacity(4);
-    let mut sources = Vec::with_capacity(4);
-    loop {
-        if terminated {
-            // Preserve the shell's finite drain contract: a descendant may
-            // retain an output handle after this command exits. Flush retained
-            // messages and available data, but do not wait for future output.
-            let mut progressed = false;
-            for (index, done) in output_done.iter_mut().enumerate() {
-                if *done {
-                    continue;
-                }
-                let progress = routes[index].poll().map_err(Error::from)?;
-                *done = routes[index].is_finished() || (!progress && !routes[index].has_pending());
-                progressed |= progress;
-            }
-            if output_done.iter().all(|done| *done) {
-                break;
-            }
-            if progressed {
-                continue;
-            }
-        }
-        waits.clear();
-        sources.clear();
-        // Termination wins over queued input, and output keeps draining after
-        // exit. Rotate I/O priority without blocking one direction on another.
-        if !terminated {
-            waits.push(WaitItem::new(
-                process.as_handle_ref(),
-                ObjectSignals::<ProcessObject>::TERMINATED,
-            ));
-            sources.push(3);
-        }
-        for offset in 0..routes.len() {
-            let index = (first + offset) % routes.len();
-            if (index == 2 && (terminated || input_closed)) || output_done.get(index) == Some(&true)
-            {
-                continue;
-            }
-            if let Some(item) = routes[index].wait_item() {
-                waits.push(item);
-                sources.push(index);
-            }
-        }
-        let observation = wait_many(&waits, hyper_os::DEADLINE_INFINITE).map_err(Error::from)?;
-        let index = *sources.get(observation.index).ok_or(Error::Protocol)?;
-        if index == 3 {
-            terminated = true;
-            continue;
-        }
-        match routes[index].poll() {
-            Ok(_) => {}
-            Err(OsError::Status(Status::PEER_CLOSED)) if index == 2 => input_closed = true,
-            Err(error) => return Err(Error::from(error)),
-        }
-        if index == 2 && routes[index].is_finished() {
-            return Err(Error::InputClosed);
-        }
-        first = (index + 1) % routes.len();
-    }
-    let info = process
-        .as_process_supervisor()
-        .info()
-        .map_err(Error::from)?;
-    if !process_succeeded(info) {
-        write_terminal(b"sh: command failed\n")?;
-    }
-    Ok(())
-}
-
-fn process_succeeded(info: ProcessInfo) -> bool {
-    matches!(
-        info.terminal,
-        Some(
-            ProcessTermination::ThreadExited { status: 0 }
-                | ProcessTermination::ProcessExited { status: 0 }
-                | ProcessTermination::LastThreadExited { status: 0 }
-        )
-    )
-}
-
-fn open_command(authorities: &CommandAuthorities, name: &str) -> Result<File, OsError> {
-    if name.starts_with('/') {
-        return authorities.root_directory.open(name, FileRights::EXECUTE);
-    }
-    if name.contains('/') {
-        let path = authorities
-            .current_path
-            .resolve(name)
-            .map_err(|_| OsError::InvalidPath)?;
-        return authorities.root_directory.open(
-            path.as_str().map_err(|_| OsError::InvalidPath)?,
-            FileRights::EXECUTE,
-        );
-    }
-    authorities
-        .root_directory
-        .open(&format!("/bin/{name}"), FileRights::EXECUTE)
-}
-
 fn write_terminal(bytes: &[u8]) -> Result<(), Error> {
     let mut output = std::io::stdout().lock();
     output.write_all(bytes).map_err(Error::Io)?;
@@ -677,18 +264,6 @@ struct CommandAuthorities {
     vm_connection: Option<CapabilityChannel>,
 }
 
-struct ChildChannels {
-    input: OwnedHandle<ByteChannelObject>,
-    output: OwnedHandle<ByteChannelObject>,
-    error: OwnedHandle<ByteChannelObject>,
-}
-
-struct ShellChannels<'a> {
-    input: &'a OwnedHandle<ByteChannelObject>,
-    output: &'a OwnedHandle<ByteChannelObject>,
-    error: &'a OwnedHandle<ByteChannelObject>,
-}
-
 enum CommandFlow {
     Continue,
     Exit,
@@ -699,7 +274,6 @@ enum Error {
     OperatingSystem(OsError),
     Io(std::io::Error),
     InvalidCommand,
-    InputClosed,
     Protocol,
 }
 
@@ -709,7 +283,6 @@ impl std::fmt::Display for Error {
             Self::OperatingSystem(error) => write!(formatter, "Native operation failed: {error:?}"),
             Self::Io(error) => write!(formatter, "I/O failed: {error}"),
             Self::InvalidCommand => formatter.write_str("command launch failed"),
-            Self::InputClosed => formatter.write_str("input channel closed"),
             Self::Protocol => formatter.write_str("protocol violation"),
         }
     }
@@ -722,7 +295,31 @@ impl From<OsError> for Error {
 }
 
 fn main() -> ExitCode {
-    hyper_shell::cli::Shell::parse();
+    let args = hyper_shell::cli::Shell::parse();
+    if let Some(words) = args.builtin {
+        let args = match Builtin::try_parse_from(std::iter::once("sh".to_owned()).chain(words)) {
+            Ok(args) => args,
+            Err(error) => {
+                let _ = error.print();
+                return ExitCode::FAILURE;
+            }
+        };
+        let result = match args.command {
+            BuiltinCommand::Pwd => std::env::current_dir()
+                .and_then(|path| writeln!(std::io::stdout(), "{}", path.display())),
+            BuiltinCommand::Clear => std::io::stdout().write_all(b"\x1b[2J\x1b[H"),
+            BuiltinCommand::Help => writeln!(
+                std::io::stdout(),
+                "builtins: cd clear exit help pwd\nPipelines: A | B; files: < > >> 2> 2>>"
+            ),
+            _ => return ExitCode::FAILURE,
+        };
+        return if result.is_ok() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
     match hyper_rt::process::startup() {
         Ok(startup) => application_main(startup),
         Err(_) => ExitCode::FAILURE,

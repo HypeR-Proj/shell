@@ -5,7 +5,11 @@ use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(about = "Native capability-scoped command shell")]
-pub struct Shell {}
+pub struct Shell {
+    /// Execute an output-only builtin in a pipeline child.
+    #[arg(long, hide = true, num_args = 1.., allow_hyphen_values = true)]
+    pub builtin: Option<Vec<String>>,
+}
 
 #[derive(Debug, Parser)]
 #[command(disable_help_subcommand = true)]
