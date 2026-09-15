@@ -70,7 +70,6 @@ impl<'a> Route<'a> {
                 return Ok(true);
             };
             let file_source = matches!(source, Endpoint::File(_));
-            let terminal_source = matches!(source, Endpoint::Terminal(_));
             let count = match source {
                 Endpoint::File(file) => file.read(&mut self.buffer).map_err(Error::Io)?,
                 source => match source
@@ -92,11 +91,6 @@ impl<'a> Route<'a> {
                 if file_source {
                     self.finish();
                 }
-                return Ok(true);
-            }
-            // Terminal EOF closes the child's pipe, not the shell's input.
-            if terminal_source && self.buffer[..count] == [4] {
-                self.finish();
                 return Ok(true);
             }
             self.pending = count;

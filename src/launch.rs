@@ -117,14 +117,28 @@ fn prepare_command(
         .map_err(|_| Error::InvalidCommand)?;
     let ChildChannels {
         input: child_input,
+        terminal_input,
         output: child_output,
         error: child_error,
     } = child;
+    if terminal_input {
+        builder
+            .add_handle_duplicate(
+                child_input.as_handle_ref(),
+                stdio::TERMINAL_INPUT.as_raw(),
+                RightsOffer::Exact(stdio::TERMINAL_INPUT_CONTRACT.required_rights()),
+            )
+            .map_err(|_| Error::InvalidCommand)?;
+    }
     add_child_channel(
         &builder,
         child_input,
         stdio::STANDARD_INPUT.as_raw(),
-        Rights::WAIT.union(Rights::READ),
+        Rights::WAIT.union(Rights::READ).union(if terminal_input {
+            Rights::INSPECT
+        } else {
+            Rights::NONE
+        }),
     )?;
     add_child_channel(
         &builder,
@@ -233,13 +247,12 @@ pub(super) fn launch_pipeline(
     }
     let mut routes = Vec::new();
     let mut builders = Vec::new();
-    let (parent_input, next_input) = channel::create_pair()?;
-    let mut next_input = Some(next_input);
-    let mut terminal_input = Some(parent_input);
+    let mut next_input = None;
     for (index, stage) in pipeline.0.iter().enumerate() {
         let last = index + 1 == pipeline.0.len();
         let (mut child_output, following_input) = channel::create_pair()?;
-        let mut child_input = next_input.take().ok_or(Error::Protocol)?;
+        let mut child_input = next_input.take();
+        let mut terminal_input = false;
         let (child_error, parent_error) = channel::create_pair()?;
         let mut input_file = None;
         let mut output_file = None;
@@ -271,10 +284,7 @@ pub(super) fn launch_pipeline(
         }
         if let Some(file) = input_file {
             let (parent, child) = channel::create_pair()?;
-            child_input = child;
-            if index == 0 {
-                terminal_input = None;
-            }
+            child_input = Some(child);
             routes.push(Route::new(
                 Endpoint::File(file),
                 Endpoint::Owned(parent),
@@ -282,12 +292,23 @@ pub(super) fn launch_pipeline(
                 Some(index),
             ));
         } else if index == 0 {
-            routes.push(Route::new(
-                Endpoint::Terminal(input),
-                Endpoint::Owned(terminal_input.take().ok_or(Error::Protocol)?),
-                None,
-                Some(index),
-            ));
+            // Share the original queue: only an actual child read consumes
+            // terminal input. An eager relay into a disposable child pipe
+            // loses typeahead when a command never reads its stdin.
+            child_input = Some(
+                input.duplicate(
+                    Rights::WAIT
+                        .union(Rights::READ)
+                        .union(Rights::DUPLICATE)
+                        .union(Rights::TRANSFER)
+                        .union(if hyper_rt::process::stdin_is_terminal() {
+                            Rights::INSPECT
+                        } else {
+                            Rights::NONE
+                        }),
+                )?,
+            );
+            terminal_input = hyper_rt::process::stdin_is_terminal();
         }
         if let Some(file) = output_file {
             let (child, parent) = channel::create_pair()?;
@@ -326,7 +347,8 @@ pub(super) fn launch_pipeline(
             source,
             authorities,
             ChildChannels {
-                input: child_input,
+                input: child_input.ok_or(Error::Protocol)?,
+                terminal_input,
                 output: child_output,
                 error: child_error,
             },
@@ -412,6 +434,7 @@ fn add_child_channel(
 ) -> Result<(), Error> {
     let rights = if [
         stdio::STANDARD_INPUT.as_raw(),
+        stdio::TERMINAL_INPUT.as_raw(),
         stdio::STANDARD_OUTPUT.as_raw(),
         stdio::STANDARD_ERROR.as_raw(),
     ]
@@ -519,6 +542,7 @@ fn open_command(authorities: &CommandAuthorities, name: &str) -> Result<File, Os
 
 struct ChildChannels {
     input: OwnedHandle<ByteChannelObject>,
+    terminal_input: bool,
     output: OwnedHandle<ByteChannelObject>,
     error: OwnedHandle<ByteChannelObject>,
 }
