@@ -111,7 +111,7 @@ fn run(startup: &mut Startup<'_>) -> Result<ExitCode, Error> {
             previous_was_carriage_return = byte == b'\r';
             match byte {
                 b'\r' | b'\n' => {
-                    write_terminal(b"\r\n")?;
+                    write_terminal(b"\n")?;
                     if discard_line {
                         write_terminal(&[PROMPT, b"sh: command line is too long\n"].concat())?;
                     } else if !line.is_empty() {
@@ -131,7 +131,7 @@ fn run(startup: &mut Startup<'_>) -> Result<ExitCode, Error> {
                 0x03 => {
                     line.clear();
                     discard_line = false;
-                    write_terminal(b"^C\r\n")?;
+                    write_terminal(b"^C\n")?;
                     write_terminal(PROMPT)?;
                 }
                 0x04 if line.is_empty() => return Ok(ExitCode::SUCCESS),
