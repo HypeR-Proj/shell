@@ -6,7 +6,7 @@ use super::{CommandAuthorities, Error, WORKING_DIRECTORY_RIGHTS, write_terminal}
 use crate::route;
 use hyper_os::capability_channel::{CapabilityChannel, CapabilityDisposition};
 use hyper_os::channel;
-use hyper_os::fs::{File, FileRights};
+use hyper_os::fs::FileRights;
 use hyper_os::handle::{
     ByteChannelObject, CapabilityChannelObject, OwnedHandle, ProcessObject, Rights, RightsOffer,
 };
@@ -24,7 +24,21 @@ fn prepare_command(
     child: ChildChannels,
 ) -> Result<ProcessBuilder, Error> {
     let name = command.argument(0).ok_or(Error::InvalidCommand)?;
-    let executable = match open_command(authorities, name) {
+    let executable_path = if name.contains('/') {
+        authorities
+            .current_path
+            .resolve(name)
+            .map_err(|_| Error::InvalidCommand)?
+            .as_str()
+            .map_err(|_| Error::InvalidCommand)?
+            .to_owned()
+    } else {
+        format!("/bin/{name}")
+    };
+    let executable = match authorities
+        .root_directory
+        .open(&executable_path, FileRights::EXECUTE)
+    {
         Ok(executable) => executable,
         Err(open_error) => {
             let reason = if matches!(open_error, OsError::Status(Status::NOT_FOUND)) {
@@ -146,29 +160,38 @@ fn prepare_command(
         stdio::STANDARD_OUTPUT.as_raw(),
         Rights::WAIT.union(Rights::WRITE),
     )?;
-    match name {
-        "ps" | "/bin/ps" => builder
+    match executable_path.as_str() {
+        "/bin/ps" => builder
             .add_handle_duplicate(
                 authorities.task_inspector.as_handle_ref(),
                 startup::TASK_INSPECTOR.as_raw(),
                 RightsOffer::Exact(Rights::INSPECT),
             )
             .map_err(|_| Error::InvalidCommand)?,
-        "handle" | "/bin/handle" => builder
-            .add_handle_duplicate(
-                authorities.object_inspector.as_handle_ref(),
-                startup::OBJECT_INSPECTOR.as_raw(),
-                RightsOffer::Exact(Rights::INSPECT),
-            )
-            .map_err(|_| Error::InvalidCommand)?,
-        "free" | "/bin/free" => builder
+        "/bin/handle" => {
+            builder
+                .add_handle_duplicate(
+                    authorities.object_inspector.as_handle_ref(),
+                    startup::OBJECT_INSPECTOR.as_raw(),
+                    RightsOffer::Exact(Rights::INSPECT.union(Rights::INSPECT_DETAILS)),
+                )
+                .map_err(|_| Error::InvalidCommand)?;
+            builder
+                .add_handle_duplicate(
+                    authorities.task_inspector.as_handle_ref(),
+                    startup::TASK_INSPECTOR.as_raw(),
+                    RightsOffer::Exact(Rights::INSPECT),
+                )
+                .map_err(|_| Error::InvalidCommand)?;
+        }
+        "/bin/free" => builder
             .add_handle_duplicate(
                 authorities.memory_inspector.as_handle_ref(),
                 startup::MEMORY_INSPECTOR.as_raw(),
                 RightsOffer::Exact(Rights::INSPECT),
             )
             .map_err(|_| Error::InvalidCommand)?,
-        "top" | "/bin/top" => {
+        "/bin/top" => {
             builder
                 .add_handle_duplicate(
                     authorities.task_inspector.as_handle_ref(),
@@ -191,7 +214,7 @@ fn prepare_command(
                 )
                 .map_err(|_| Error::InvalidCommand)?;
         }
-        "vmm" | "/bin/vmm" if authorities.vm_connection.is_some() => {
+        "/bin/vmm" if authorities.vm_connection.is_some() => {
             let (client_control, manager_control) = channel::create_pair().map_err(Error::from)?;
             let (manager_capabilities, client_capabilities) =
                 CapabilityChannel::create().map_err(Error::from)?;
@@ -519,25 +542,6 @@ fn process_succeeded(info: ProcessInfo) -> bool {
                 | ProcessTermination::LastThreadExited { status: 0 }
         )
     )
-}
-
-fn open_command(authorities: &CommandAuthorities, name: &str) -> Result<File, OsError> {
-    if name.starts_with('/') {
-        return authorities.root_directory.open(name, FileRights::EXECUTE);
-    }
-    if name.contains('/') {
-        let path = authorities
-            .current_path
-            .resolve(name)
-            .map_err(|_| OsError::InvalidPath)?;
-        return authorities.root_directory.open(
-            path.as_str().map_err(|_| OsError::InvalidPath)?,
-            FileRights::EXECUTE,
-        );
-    }
-    authorities
-        .root_directory
-        .open(&format!("/bin/{name}"), FileRights::EXECUTE)
 }
 
 struct ChildChannels {
