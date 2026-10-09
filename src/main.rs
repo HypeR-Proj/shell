@@ -18,7 +18,8 @@ use hyper_os::handle::{
 use hyper_os::startup::{self, Startup};
 use hyper_service::{process, vm};
 use hyper_shell::cli::{Builtin, BuiltinCommand};
-use hyper_shell::command::{MAX_LINE_BYTES, Pipeline};
+use hyper_shell::command::Pipeline;
+use hyper_shell::editor::{Action, Editor};
 use hyper_shell::path::CanonicalPath;
 use std::io::Write;
 use std::process::ExitCode;
@@ -93,9 +94,7 @@ fn run(startup: &mut Startup<'_>) -> Result<ExitCode, Error> {
     write_terminal(READY_MESSAGE)?;
     write_terminal(PROMPT)?;
 
-    let mut line = Vec::with_capacity(MAX_LINE_BYTES);
-    let mut discard_line = false;
-    let mut previous_was_carriage_return = false;
+    let mut editor = Editor::default();
     let mut input_chunk = [0_u8; INPUT_CHUNK_BYTES];
     loop {
         let count = input
@@ -104,56 +103,37 @@ fn run(startup: &mut Startup<'_>) -> Result<ExitCode, Error> {
             .map_err(Error::from)?;
         let bytes = input_chunk.get(..count).ok_or(Error::Protocol)?;
         for byte in bytes.iter().copied() {
-            if byte == b'\n' && previous_was_carriage_return {
-                previous_was_carriage_return = false;
-                continue;
-            }
-            previous_was_carriage_return = byte == b'\r';
-            match byte {
-                b'\r' | b'\n' => {
-                    write_terminal(b"\n")?;
-                    if discard_line {
-                        write_terminal(&[PROMPT, b"sh: command line is too long\n"].concat())?;
-                    } else if !line.is_empty() {
-                        let command = line.as_slice();
-                        match execute_line(command, &mut authorities, input, output, error) {
-                            Ok(CommandFlow::Continue) => {}
-                            Ok(CommandFlow::Exit) => return Ok(ExitCode::SUCCESS),
-                            Err(command_error) => {
-                                write_terminal(format!("sh: {command_error}\n").as_bytes())?
-                            }
-                        }
+            match editor.push(byte) {
+                Action::None => (),
+                Action::Echo(byte) => write_terminal(&[byte])?,
+                Action::Redraw | Action::ClearScreen => {
+                    // Redraw the whole line so history and multibyte deletion
+                    // do not leave stale text behind the cursor.
+                    if byte == 12 {
+                        write_terminal(b"\x1b[2J\x1b[H")?;
                     }
-                    line.clear();
-                    discard_line = false;
+                    write_terminal(b"\r\x1b[2K")?;
+                    write_terminal(PROMPT)?;
+                    write_terminal(editor.line())?;
+                }
+                Action::Submit(line) => {
+                    write_terminal(b"\n")?;
+                    match execute_line(&line, &mut authorities, input, output, error) {
+                        Ok(CommandFlow::Continue) => (),
+                        Ok(CommandFlow::Exit) => return Ok(ExitCode::SUCCESS),
+                        Err(error) => write_terminal(format!("sh: {error}\n").as_bytes())?,
+                    }
                     write_terminal(PROMPT)?;
                 }
-                0x03 => {
-                    line.clear();
-                    discard_line = false;
+                Action::TooLong => {
+                    write_terminal(b"\nsh: command line is too long\n")?;
+                    write_terminal(PROMPT)?;
+                }
+                Action::Cancel => {
                     write_terminal(b"^C\n")?;
                     write_terminal(PROMPT)?;
                 }
-                0x04 if line.is_empty() => return Ok(ExitCode::SUCCESS),
-                0x08 | 0x7f => {
-                    // DEL must remain an editing key even on an empty line;
-                    // otherwise it falls through into the printable bytes.
-                    if !discard_line && line.pop().is_some() {
-                        write_terminal(b"\x08 \x08")?;
-                    }
-                }
-                byte if byte == b'\t' || byte >= 0x20 => {
-                    if discard_line {
-                        continue;
-                    }
-                    if line.len() == MAX_LINE_BYTES {
-                        discard_line = true;
-                        continue;
-                    }
-                    line.push(byte);
-                    write_terminal(std::slice::from_ref(&byte))?;
-                }
-                _ => {}
+                Action::Exit => return Ok(ExitCode::SUCCESS),
             }
         }
     }
@@ -197,7 +177,7 @@ fn execute_line(
     };
     match builtin {
         BuiltinCommand::Help => {
-            writeln!(std::io::stdout(), "builtins: cd clear exit help pwd\napps: cat grep echo ls ps free top handle vmm\nPipelines: A | B; files: < > >> 2> 2>>\nUse APP --help for options.")
+            writeln!(std::io::stdout(), "builtins: cd clear exit help pwd\napps: cat grep echo ls ps free top handle vmm\nPipelines: A | B; files: < > >> 2> 2>>\nHistory: Up/Down; Ctrl-U clears the line; Ctrl-L redraws.\nUse APP --help for options (echo: -n, -e, -E).")
                 .map_err(Error::Io)?
         }
         BuiltinCommand::Cd(args) => builtin_cd(&args.directory, authorities)?,
