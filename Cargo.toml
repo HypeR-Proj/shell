@@ -18,11 +18,14 @@ test = false
 bench = false
 
 [dependencies]
+clap.workspace = true
 hyper-os.workspace = true
 hyper-rt.workspace = true
 hyper-service.workspace = true
-clap.workspace = true
-shlex.workspace = true
+shlex = "=1.3.0"
 
 [lints]
 workspace = true
+
+[target.'cfg(target_os = "hyper")'.dependencies]
+hyper-clap-shared.workspace = true

@@ -3,6 +3,10 @@
 
 //! Initial Native command shell and capability-scoped command launcher.
 
+// Select the shared parser implementation for Native delivery.
+#[cfg(target_os = "hyper")]
+extern crate hyper_clap_shared as _;
+
 mod launch;
 mod route;
 use launch::launch_pipeline;
