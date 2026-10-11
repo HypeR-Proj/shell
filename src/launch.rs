@@ -6,7 +6,6 @@ use super::{CommandAuthorities, Error, WORKING_DIRECTORY_RIGHTS, write_terminal}
 use crate::route;
 use hyper_os::capability_channel::{CapabilityChannel, CapabilityDisposition};
 use hyper_os::channel;
-use hyper_os::fs::FileRights;
 use hyper_os::handle::{
     ByteChannelObject, CapabilityChannelObject, OwnedHandle, ProcessObject, Rights, RightsOffer,
 };
@@ -14,8 +13,9 @@ use hyper_os::startup;
 use hyper_os::task::{ProcessBuilder, ProcessInfo, ProcessTermination};
 use hyper_os::wait::{ObjectSignals, WaitItem, wait_many};
 use hyper_os::{Error as OsError, Status};
-use hyper_service::{process, stdio, vm};
+use hyper_service::{filesystem, process, stdio, vm};
 use hyper_shell::command::{CommandLine, Pipeline};
+use hyper_shell::program::{Authority, ImageSource, Program, RuntimeEnvironment};
 
 fn prepare_command(
     command: &CommandLine,
@@ -24,21 +24,16 @@ fn prepare_command(
     child: ChildChannels,
 ) -> Result<ProcessBuilder, Error> {
     let name = command.argument(0).ok_or(Error::InvalidCommand)?;
-    let executable_path = if name.contains('/') {
-        authorities
-            .current_path
-            .resolve(name)
-            .map_err(|_| Error::InvalidCommand)?
-            .as_str()
-            .map_err(|_| Error::InvalidCommand)?
-            .to_owned()
-    } else {
-        format!("/bin/{name}")
+    let program =
+        Program::resolve(name, &authorities.current_path).map_err(|_| Error::InvalidCommand)?;
+    let image_directory = match program.source {
+        ImageSource::Environment => &authorities.environment,
+        ImageSource::Namespace => &authorities.root_directory,
     };
-    let executable = match authorities
-        .root_directory
-        .open(&executable_path, FileRights::EXECUTE)
-    {
+    let executable = match image_directory.open(
+        &program.path,
+        hyper_service::process::EXECUTABLE_FILE_RIGHTS,
+    ) {
         Ok(executable) => executable,
         Err(open_error) => {
             let reason = if matches!(open_error, OsError::Status(Status::NOT_FOUND)) {
@@ -56,13 +51,62 @@ fn prepare_command(
             return Err(Error::InvalidCommand);
         }
     };
+    // Commands outside the recovery tree use the full loader even for static ELF.
+    // Keep recovery independent of the mounted system and its loader.
+    // Resolve /system only when starting a system command. A directory opened
+    // before storage mounts would keep naming the covered RAM directory.
+    let system_environment = match program.environment {
+        RuntimeEnvironment::Recovery => None,
+        RuntimeEnvironment::System => Some(
+            process::open_environment(&authorities.root_directory, "/system")
+                .map_err(Error::from)?,
+        ),
+    };
+    let system_libraries = system_environment
+        .as_ref()
+        .map(process::open_library_directory)
+        .transpose()
+        .map_err(Error::from)?;
+    let command_loader = system_environment
+        .as_ref()
+        .map(|environment| process::open_loader(environment, process::LoaderKind::Dynamic))
+        .transpose()
+        .map_err(Error::from)?;
+    let loader = command_loader.as_ref().unwrap_or(&authorities.loader);
     let builder = ProcessBuilder::create(
         authorities.factory.as_handle_ref(),
         authorities.group.as_handle_ref(),
         authorities.domain.as_handle_ref(),
         executable.as_handle_ref(),
+        loader.as_handle_ref(),
     )
     .map_err(Error::from)?;
+    if program.is_shell() {
+        process::ShellDelegation {
+            environment: authorities.environment.as_handle_ref(),
+            loader: authorities.loader.as_handle_ref(),
+            libraries: authorities.library_directory.as_handle_ref(),
+            tasks: authorities.task_inspector.as_handle_ref(),
+            objects: authorities.object_inspector.as_handle_ref(),
+            memory: authorities.memory_inspector.as_handle_ref(),
+            cpus: authorities.cpu_inspector.as_handle_ref(),
+            filesystem: authorities
+                .filesystem_control
+                .as_ref()
+                .map(OwnedHandle::as_handle_ref),
+            virtual_machines: authorities
+                .vm_connection
+                .as_ref()
+                .map(CapabilityChannel::as_handle_ref),
+        }
+        .add_to(&builder)?;
+    } else {
+        builder.add_handle_duplicate(
+            loader.as_handle_ref(),
+            process::CHILD_LOADER.as_raw(),
+            RightsOffer::Exact(process::CHILD_LOADER_CONTRACT.allowed_rights()),
+        )?;
+    }
     builder.set_name(name).map_err(Error::from)?;
     for index in 0..command.len() {
         builder
@@ -71,11 +115,15 @@ fn prepare_command(
     }
     builder
         .add_handle_duplicate(
-            authorities.library_directory.as_handle_ref(),
+            system_libraries
+                .as_ref()
+                .unwrap_or(&authorities.library_directory)
+                .as_handle_ref(),
             startup::DYNAMIC_LIBRARY_DIRECTORY.as_raw(),
             RightsOffer::Exact(
                 Rights::READ
                     .union(Rights::EXECUTE)
+                    .union(Rights::PROTECT)
                     .union(Rights::DUPLICATE)
                     .union(Rights::TRANSFER),
             ),
@@ -160,15 +208,26 @@ fn prepare_command(
         stdio::STANDARD_OUTPUT.as_raw(),
         Rights::WAIT.union(Rights::WRITE),
     )?;
-    match executable_path.as_str() {
-        "/bin/ps" => builder
+    match program.authority {
+        Some(Authority::Filesystem) => {
+            if let Some(control) = authorities.filesystem_control.as_ref() {
+                builder
+                    .add_handle_duplicate(
+                        control.as_handle_ref(),
+                        filesystem::CONTROL_CLIENT.as_raw(),
+                        RightsOffer::Exact(Rights::WAIT.union(Rights::WRITE)),
+                    )
+                    .map_err(|_| Error::InvalidCommand)?;
+            }
+        }
+        Some(Authority::Tasks) => builder
             .add_handle_duplicate(
                 authorities.task_inspector.as_handle_ref(),
                 startup::TASK_INSPECTOR.as_raw(),
                 RightsOffer::Exact(Rights::INSPECT),
             )
             .map_err(|_| Error::InvalidCommand)?,
-        "/bin/handle" => {
+        Some(Authority::Handles) => {
             builder
                 .add_handle_duplicate(
                     authorities.object_inspector.as_handle_ref(),
@@ -184,14 +243,14 @@ fn prepare_command(
                 )
                 .map_err(|_| Error::InvalidCommand)?;
         }
-        "/bin/free" => builder
+        Some(Authority::Memory) => builder
             .add_handle_duplicate(
                 authorities.memory_inspector.as_handle_ref(),
                 startup::MEMORY_INSPECTOR.as_raw(),
                 RightsOffer::Exact(Rights::INSPECT),
             )
             .map_err(|_| Error::InvalidCommand)?,
-        "/bin/top" => {
+        Some(Authority::Activity) => {
             builder
                 .add_handle_duplicate(
                     authorities.task_inspector.as_handle_ref(),
@@ -214,7 +273,7 @@ fn prepare_command(
                 )
                 .map_err(|_| Error::InvalidCommand)?;
         }
-        "/bin/vmm" if authorities.vm_connection.is_some() => {
+        Some(Authority::VirtualMachines) if authorities.vm_connection.is_some() => {
             let (client_control, manager_control) = channel::create_pair().map_err(Error::from)?;
             let (manager_capabilities, client_capabilities) =
                 CapabilityChannel::create().map_err(Error::from)?;
@@ -353,7 +412,7 @@ pub(super) fn launch_pipeline(
         let builtin = matches!(stage.command.argument(0), Some("pwd" | "clear" | "help"));
         let worker;
         let command = if builtin {
-            let mut words = vec!["/bin/sh".to_owned(), "--builtin".to_owned()];
+            let mut words = vec!["sh".to_owned(), "--builtin".to_owned()];
             words.extend(stage.command.arguments().map(str::to_owned));
             worker = CommandLine::parse(
                 shlex::try_join(words.iter().map(String::as_str))

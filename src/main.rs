@@ -3,7 +3,7 @@
 
 //! Initial Native command shell and capability-scoped command launcher.
 
-// Select the shared parser implementation for Native delivery.
+// Select the shared parser implementation for the formal environment.
 #[cfg(target_os = "hyper")]
 extern crate hyper_clap_shared as _;
 
@@ -14,13 +14,14 @@ use launch::launch_pipeline;
 use clap::Parser;
 use hyper_os::Error as OsError;
 use hyper_os::capability_channel::CapabilityChannel;
-use hyper_os::fs::{Directory, DirectoryRights};
+use hyper_os::fs::{Directory, DirectoryRights, File};
 use hyper_os::handle::{
-    ByteChannelObject, CpuInspectorObject, MemoryInspectorObject, ObjectInspectorObject,
-    OwnedHandle, ResourceDomainObject, TaskFactoryObject, TaskGroupObject, TaskInspectorObject,
+    ByteChannelObject, CapabilityChannelObject, CpuInspectorObject, MemoryInspectorObject,
+    ObjectInspectorObject, OwnedHandle, ResourceDomainObject, TaskFactoryObject, TaskGroupObject,
+    TaskInspectorObject,
 };
 use hyper_os::startup::{self, Startup};
-use hyper_service::{process, vm};
+use hyper_service::{filesystem, process, vm};
 use hyper_shell::cli::{Builtin, BuiltinCommand};
 use hyper_shell::command::Pipeline;
 use hyper_shell::editor::{Action, Editor};
@@ -37,6 +38,7 @@ const WORKING_DIRECTORY_RIGHTS: DirectoryRights = DirectoryRights::READ
     .union(DirectoryRights::LOCK_FILE)
     .union(DirectoryRights::INSPECT)
     .union(DirectoryRights::EXECUTE)
+    .union(DirectoryRights::PROTECT)
     .union(DirectoryRights::DUPLICATE)
     .union(DirectoryRights::TRANSFER);
 
@@ -55,14 +57,22 @@ fn run(startup: &mut Startup<'_>) -> Result<ExitCode, Error> {
     // through a second session queue lets a prompt overtake pending stderr.
     let error = output;
     let root_directory = startup.take_root_directory().map_err(Error::from)?;
+    let environment = Directory::from_handle(
+        startup
+            .take(process::ENVIRONMENT_DIRECTORY)
+            .map_err(Error::from)?,
+    );
+    // Keep the initial cwd attached to the namespace root. Opening "/" would
+    // instead retain the old ramdisk directory across the init root switch.
     let current_directory = root_directory
-        .open_directory("/", WORKING_DIRECTORY_RIGHTS)
+        .scope_at(&root_directory, WORKING_DIRECTORY_RIGHTS)
         .map_err(Error::from)?;
     let library_directory = Directory::from_handle(
         startup
             .take(process::CHILD_LIBRARY_DIRECTORY)
             .map_err(Error::from)?,
     );
+    let loader = File::from_handle(startup.take(process::CHILD_LOADER).map_err(Error::from)?);
     let factory = startup.take(startup::TASK_FACTORY).map_err(Error::from)?;
     let group = startup.take(startup::TASK_GROUP).map_err(Error::from)?;
     let domain = startup
@@ -80,11 +90,16 @@ fn run(startup: &mut Startup<'_>) -> Result<ExitCode, Error> {
         .take_optional(vm::MANAGER_CONNECTION)
         .map_err(Error::from)?
         .map(CapabilityChannel::from_handle);
+    let filesystem_control = startup
+        .take_optional(filesystem::CONTROL_CLIENT)
+        .map_err(Error::from)?;
     let mut authorities = CommandAuthorities {
         root_directory,
+        environment,
         current_directory,
         current_path: CanonicalPath::root(),
         library_directory,
+        loader,
         factory,
         group,
         domain,
@@ -93,6 +108,7 @@ fn run(startup: &mut Startup<'_>) -> Result<ExitCode, Error> {
         memory_inspector,
         cpu_inspector,
         vm_connection,
+        filesystem_control,
     };
 
     write_terminal(READY_MESSAGE)?;
@@ -211,10 +227,16 @@ fn builtin_cd(target: &str, authorities: &mut CommandAuthorities) -> Result<(), 
         }
     };
     let path_text = path.as_str().map_err(|_| Error::InvalidCommand)?;
-    let directory = match authorities
-        .root_directory
-        .open_directory(path_text, WORKING_DIRECTORY_RIGHTS)
-    {
+    let directory = if path_text == "/" {
+        authorities
+            .root_directory
+            .scope_at(&authorities.root_directory, WORKING_DIRECTORY_RIGHTS)
+    } else {
+        authorities
+            .root_directory
+            .open_directory(path_text, WORKING_DIRECTORY_RIGHTS)
+    };
+    let directory = match directory {
         Ok(directory) => directory,
         Err(_) => {
             write_terminal(b"cd: cannot open directory\n")?;
@@ -235,9 +257,11 @@ fn write_terminal(bytes: &[u8]) -> Result<(), Error> {
 
 struct CommandAuthorities {
     root_directory: Directory,
+    environment: Directory,
     current_directory: Directory,
     current_path: CanonicalPath,
     library_directory: Directory,
+    loader: File,
     factory: OwnedHandle<TaskFactoryObject>,
     group: OwnedHandle<TaskGroupObject>,
     domain: OwnedHandle<ResourceDomainObject>,
@@ -246,6 +270,7 @@ struct CommandAuthorities {
     memory_inspector: OwnedHandle<MemoryInspectorObject>,
     cpu_inspector: OwnedHandle<CpuInspectorObject>,
     vm_connection: Option<CapabilityChannel>,
+    filesystem_control: Option<OwnedHandle<CapabilityChannelObject>>,
 }
 
 enum CommandFlow {
