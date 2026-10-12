@@ -18,6 +18,7 @@ test = false
 bench = false
 
 [dependencies]
+hyper-terminal = { path = "../../lib/terminal" }
 clap.workspace = true
 hyper-os.workspace = true
 hyper-rt.workspace = true

@@ -11,32 +11,32 @@ use std::fs::File;
 use std::io::{Read, Write};
 
 type Channel = OwnedHandle<ByteChannelObject>;
-pub enum Endpoint<'a> {
+pub enum Endpoint {
     Owned(Channel),
-    Terminal(&'a Channel),
+    Terminal,
     File(File),
 }
-impl Endpoint<'_> {
+impl Endpoint {
     fn channel(&self) -> Option<&Channel> {
         match self {
             Self::Owned(c) => Some(c),
-            Self::Terminal(c) => Some(c),
+            Self::Terminal => None,
             Self::File(_) => None,
         }
     }
 }
-pub struct Route<'a> {
-    source: Option<Endpoint<'a>>,
-    destination: Option<Endpoint<'a>>,
+pub struct Route {
+    source: Option<Endpoint>,
+    destination: Option<Endpoint>,
     buffer: Vec<u8>,
     pending: usize,
     pub producer: Option<usize>,
     pub consumer: Option<usize>,
 }
-impl<'a> Route<'a> {
+impl Route {
     pub fn new(
-        source: Endpoint<'a>,
-        destination: Endpoint<'a>,
+        source: Endpoint,
+        destination: Endpoint,
         producer: Option<usize>,
         consumer: Option<usize>,
     ) -> Self {
@@ -99,6 +99,15 @@ impl<'a> Route<'a> {
             Endpoint::File(file) => file
                 .write_all(&self.buffer[..self.pending])
                 .map_err(Error::Io)?,
+            Endpoint::Terminal => {
+                let mut output = std::io::stdout().lock();
+                output
+                    .write_all(&self.buffer[..self.pending])
+                    .map_err(Error::Io)?;
+                // A relayed child prompt need not end in LF. Do not retain it
+                // in this shell's line buffer while the child waits for input.
+                output.flush().map_err(Error::Io)?;
+            }
             destination => match destination
                 .channel()
                 .ok_or(Error::Protocol)?

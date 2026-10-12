@@ -13,6 +13,7 @@ use hyper_os::startup;
 use hyper_os::task::{ProcessBuilder, ProcessInfo, ProcessTermination};
 use hyper_os::wait::{ObjectSignals, WaitItem, wait_many};
 use hyper_os::{Error as OsError, Status};
+use hyper_service::stdio::{Inherited, StandardStream};
 use hyper_service::{filesystem, process, stdio, vm};
 use hyper_shell::command::{CommandLine, Pipeline};
 use hyper_shell::program::{Authority, ImageSource, Program, RuntimeEnvironment};
@@ -177,37 +178,24 @@ fn prepare_command(
             ),
         )
         .map_err(|_| Error::InvalidCommand)?;
-    let ChildChannels {
-        input: child_input,
-        terminal_input,
-        output: child_output,
-        error: child_error,
-    } = child;
-    if terminal_input {
+    child.input.add_to(&builder, StandardStream::Input)?;
+    if let Some((control, events)) = child.terminal {
         builder
-            .add_handle_duplicate(
-                child_input.as_handle_ref(),
-                stdio::TERMINAL_INPUT.as_raw(),
-                RightsOffer::Exact(stdio::TERMINAL_INPUT_CONTRACT.required_rights()),
+            .add_handle_move(
+                control,
+                hyper_terminal::client::CONTROL.as_raw(),
+                RightsOffer::Exact(hyper_terminal::client::CONTROL_RIGHTS),
             )
-            .map_err(|_| Error::InvalidCommand)?;
+            .map_err(|failure| failure.error())?;
+        builder
+            .add_handle_move(
+                events,
+                hyper_terminal::client::EVENTS.as_raw(),
+                RightsOffer::Exact(hyper_terminal::client::EVENT_RIGHTS),
+            )
+            .map_err(|failure| failure.error())?;
     }
-    add_child_channel(
-        &builder,
-        child_input,
-        stdio::STANDARD_INPUT.as_raw(),
-        Rights::WAIT.union(Rights::READ).union(if terminal_input {
-            Rights::INSPECT
-        } else {
-            Rights::NONE
-        }),
-    )?;
-    add_child_channel(
-        &builder,
-        child_output,
-        stdio::STANDARD_OUTPUT.as_raw(),
-        Rights::WAIT.union(Rights::WRITE),
-    )?;
+    child.output.add_to(&builder, StandardStream::Output)?;
     match program.authority {
         Some(Authority::Filesystem) => {
             if let Some(control) = authorities.filesystem_control.as_ref() {
@@ -301,12 +289,7 @@ fn prepare_command(
         }
         _ => {}
     }
-    add_child_channel(
-        &builder,
-        child_error,
-        stdio::STANDARD_ERROR.as_raw(),
-        Rights::WAIT.union(Rights::WRITE),
-    )?;
+    child.error.add_to(&builder, StandardStream::Error)?;
     builder.seal().map_err(Error::from)?;
     Ok(builder)
 }
@@ -314,10 +297,26 @@ fn prepare_command(
 pub(super) fn launch_pipeline(
     pipeline: &Pipeline,
     source: &[u8],
-    authorities: &CommandAuthorities,
-    input: &OwnedHandle<ByteChannelObject>,
-    output: &OwnedHandle<ByteChannelObject>,
-    error: &OwnedHandle<ByteChannelObject>,
+    authorities: &mut CommandAuthorities,
+    input: &Inherited,
+) -> Result<(), Error> {
+    let mut lease = None;
+    let result = launch_pipeline_inner(pipeline, source, authorities, input, &mut lease);
+    if let (Some(id), Some(terminal)) = (lease, authorities.terminal.as_mut()) {
+        let cleanup = terminal.release_child(id).map_err(Error::from);
+        if result.is_ok() {
+            cleanup?;
+        }
+    }
+    result
+}
+
+fn launch_pipeline_inner(
+    pipeline: &Pipeline,
+    source: &[u8],
+    authorities: &mut CommandAuthorities,
+    input: &Inherited,
+    terminal_lease: &mut Option<u64>,
 ) -> Result<(), Error> {
     use route::{Endpoint, Route};
     // Reject state-changing builtins before opening/truncating any redirects.
@@ -329,12 +328,14 @@ pub(super) fn launch_pipeline(
     }
     let mut routes = Vec::new();
     let mut builders = Vec::new();
+
     let mut next_input = None;
     for (index, stage) in pipeline.0.iter().enumerate() {
         let last = index + 1 == pipeline.0.len();
         let (mut child_output, following_input) = channel::create_pair()?;
-        let mut child_input = next_input.take();
-        let mut terminal_input = false;
+        let mut child_input = next_input.take().map(Inherited::Pipe);
+        let mut terminal_caps = None;
+        let mut terminal_output = None;
         let (child_error, parent_error) = channel::create_pair()?;
         let mut input_file = None;
         let mut output_file = None;
@@ -366,7 +367,7 @@ pub(super) fn launch_pipeline(
         }
         if let Some(file) = input_file {
             let (parent, child) = channel::create_pair()?;
-            child_input = Some(child);
+            child_input = Some(Inherited::Pipe(child));
             routes.push(Route::new(
                 Endpoint::File(file),
                 Endpoint::Owned(parent),
@@ -374,24 +375,23 @@ pub(super) fn launch_pipeline(
                 Some(index),
             ));
         } else if index == 0 {
-            // Share the original queue: only an actual child read consumes
-            // terminal input. An eager relay into a disposable child pipe
-            // loses typeahead when a command never reads its stdin.
-            child_input = Some(
-                input.duplicate(
-                    Rights::WAIT
-                        .union(Rights::READ)
-                        .union(Rights::DUPLICATE)
-                        .union(Rights::TRANSFER)
-                        .union(if hyper_rt::process::stdin_is_terminal() {
-                            Rights::INSPECT
-                        } else {
-                            Rights::NONE
-                        }),
-                )?,
-            );
-            terminal_input = hyper_rt::process::stdin_is_terminal();
+            // A prepared child gets its own reader connector. No input is
+            // consumed until the child actually issues a read after binding.
+            if let Some(terminal) = authorities.terminal.as_mut() {
+                let client = terminal.prepare_child()?;
+                *terminal_lease = Some(client.id);
+                terminal_output = Some(
+                    client
+                        .stream
+                        .duplicate(hyper_os::stream::CONNECTOR_RIGHTS)?,
+                );
+                child_input = Some(Inherited::Stream(client.stream));
+                terminal_caps = Some((client.control, client.events));
+            } else {
+                child_input = Some(input.duplicate(StandardStream::Input)?);
+            }
         }
+        let direct_output = last && output_file.is_none() && terminal_output.is_some();
         if let Some(file) = output_file {
             let (child, parent) = channel::create_pair()?;
             child_output = child;
@@ -402,13 +402,30 @@ pub(super) fn launch_pipeline(
                 None,
             ));
         }
-        let error_destination = error_file.map_or(Endpoint::Terminal(error), Endpoint::File);
-        routes.push(Route::new(
-            Endpoint::Owned(parent_error),
-            error_destination,
-            Some(index),
-            None,
-        ));
+        let child_error = if error_file.is_none() && terminal_output.is_some() {
+            drop(child_error);
+            drop(parent_error);
+            Inherited::Stream(
+                terminal_output
+                    .as_ref()
+                    .ok_or(Error::Protocol)?
+                    .duplicate(hyper_os::stream::CONNECTOR_RIGHTS)?,
+            )
+        } else {
+            routes.push(Route::new(
+                Endpoint::Owned(parent_error),
+                error_file.map_or(Endpoint::Terminal, Endpoint::File),
+                Some(index),
+                None,
+            ));
+            Inherited::Pipe(child_error)
+        };
+        let child_output = if direct_output {
+            drop(child_output);
+            Inherited::Stream(terminal_output.take().ok_or(Error::Protocol)?)
+        } else {
+            Inherited::Pipe(child_output)
+        };
         let builtin = matches!(stage.command.argument(0), Some("pwd" | "clear" | "help"));
         let worker;
         let command = if builtin {
@@ -430,16 +447,16 @@ pub(super) fn launch_pipeline(
             authorities,
             ChildChannels {
                 input: child_input.ok_or(Error::Protocol)?,
-                terminal_input,
+                terminal: terminal_caps,
                 output: child_output,
                 error: child_error,
             },
         )?);
         next_input = Some(following_input);
-        if last {
+        if last && !direct_output {
             routes.push(Route::new(
                 Endpoint::Owned(next_input.take().ok_or(Error::Protocol)?),
-                Endpoint::Terminal(output),
+                Endpoint::Terminal,
                 Some(index),
                 None,
             ));
@@ -447,15 +464,19 @@ pub(super) fn launch_pipeline(
     }
     drop(next_input);
     let mut running = Running(Vec::new());
-    for builder in builders {
-        running.0.push(
-            builder
-                .start()
-                .map_err(|failure| Error::from(failure.error()))?,
-        );
+    for (index, builder) in builders.into_iter().enumerate() {
+        let process = builder
+            .start()
+            .map_err(|failure| Error::from(failure.error()))?;
+        running.0.push(process);
+        if index == 0
+            && let (Some(id), Some(terminal)) = (*terminal_lease, authorities.terminal.as_mut())
+        {
+            let process = running.0.last().ok_or(Error::Protocol)?;
+            terminal.bind_child(id, process.as_process_supervisor().observe()?)?;
+        }
     }
-    relay_pipeline(&running.0, &mut routes)?;
-    Ok(())
+    relay_pipeline(&running.0, &mut routes)
 }
 
 struct Running(Vec<OwnedHandle<ProcessObject>>);
@@ -516,7 +537,6 @@ fn add_child_channel(
 ) -> Result<(), Error> {
     let rights = if [
         stdio::STANDARD_INPUT.as_raw(),
-        stdio::TERMINAL_INPUT.as_raw(),
         stdio::STANDARD_OUTPUT.as_raw(),
         stdio::STANDARD_ERROR.as_raw(),
     ]
@@ -533,7 +553,7 @@ fn add_child_channel(
 
 fn relay_pipeline(
     processes: &[OwnedHandle<ProcessObject>],
-    routes: &mut [route::Route<'_>],
+    routes: &mut [route::Route],
 ) -> Result<(), Error> {
     let mut terminated = vec![false; processes.len()];
     let mut first = 0;
@@ -604,8 +624,11 @@ fn process_succeeded(info: ProcessInfo) -> bool {
 }
 
 struct ChildChannels {
-    input: OwnedHandle<ByteChannelObject>,
-    terminal_input: bool,
-    output: OwnedHandle<ByteChannelObject>,
-    error: OwnedHandle<ByteChannelObject>,
+    input: Inherited,
+    terminal: Option<(
+        OwnedHandle<CapabilityChannelObject>,
+        OwnedHandle<ByteChannelObject>,
+    )>,
+    output: Inherited,
+    error: Inherited,
 }

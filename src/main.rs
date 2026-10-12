@@ -16,20 +16,20 @@ use hyper_os::Error as OsError;
 use hyper_os::capability_channel::CapabilityChannel;
 use hyper_os::fs::{Directory, DirectoryRights, File};
 use hyper_os::handle::{
-    ByteChannelObject, CapabilityChannelObject, CpuInspectorObject, MemoryInspectorObject,
-    ObjectInspectorObject, OwnedHandle, ResourceDomainObject, TaskFactoryObject, TaskGroupObject,
-    TaskInspectorObject,
+    CapabilityChannelObject, CpuInspectorObject, MemoryInspectorObject, ObjectInspectorObject,
+    OwnedHandle, ResourceDomainObject, TaskFactoryObject, TaskGroupObject, TaskInspectorObject,
 };
 use hyper_os::startup::{self, Startup};
+use hyper_service::stdio::Inherited;
 use hyper_service::{filesystem, process, vm};
 use hyper_shell::cli::{Builtin, BuiltinCommand};
 use hyper_shell::command::Pipeline;
 use hyper_shell::editor::{Action, Editor};
 use hyper_shell::path::CanonicalPath;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::ExitCode;
 
-const INPUT_CHUNK_BYTES: usize = 256;
+const INPUT_CHUNK_BYTES: usize = 1;
 const READY_MESSAGE: &[u8] = b"HypeR session: console ready\n";
 const PROMPT: &[u8] = b"hyper-sh$ ";
 const WORKING_DIRECTORY_RIGHTS: DirectoryRights = DirectoryRights::READ
@@ -51,11 +51,20 @@ fn application_main(mut startup: Startup<'_>) -> ExitCode {
 
 fn run(startup: &mut Startup<'_>) -> Result<ExitCode, Error> {
     hyper_os::require_core_abi().map_err(Error::from)?;
-    let input = hyper_rt::process::stdin().map_err(Error::from)?;
-    let output = hyper_rt::process::stdout().map_err(Error::from)?;
-    // This interactive shell presents one terminal stream. Routing diagnostics
-    // through a second session queue lets a prompt overtake pending stderr.
-    let error = output;
+    let input = if let Some(stream) = hyper_rt::process::stdin_stream()? {
+        Inherited::Stream(stream.duplicate(hyper_os::stream::CONNECTOR_RIGHTS)?)
+    } else {
+        Inherited::Pipe(
+            hyper_rt::process::stdin()?
+                .duplicate(hyper_service::stdio::STANDARD_INPUT_CONTRACT.allowed_rights())?,
+        )
+    };
+    let mut terminal = hyper_terminal::Terminal::take(startup)?;
+    if let Some(terminal) = terminal.as_mut() {
+        let mut settings = hyper_terminal::Settings::raw();
+        settings.output.lf_to_crlf = true;
+        terminal.set_settings(settings)?;
+    }
     let root_directory = startup.take_root_directory().map_err(Error::from)?;
     let environment = Directory::from_handle(
         startup
@@ -109,6 +118,7 @@ fn run(startup: &mut Startup<'_>) -> Result<ExitCode, Error> {
         cpu_inspector,
         vm_connection,
         filesystem_control,
+        terminal,
     };
 
     write_terminal(READY_MESSAGE)?;
@@ -117,10 +127,10 @@ fn run(startup: &mut Startup<'_>) -> Result<ExitCode, Error> {
     let mut editor = Editor::default();
     let mut input_chunk = [0_u8; INPUT_CHUNK_BYTES];
     loop {
-        let count = input
-            .as_byte_channel()
-            .receive(&mut input_chunk)
-            .map_err(Error::from)?;
+        let count = std::io::stdin().read(&mut input_chunk).map_err(Error::Io)?;
+        if count == 0 {
+            return Ok(ExitCode::SUCCESS);
+        }
         let bytes = input_chunk.get(..count).ok_or(Error::Protocol)?;
         for byte in bytes.iter().copied() {
             match editor.push(byte) {
@@ -138,7 +148,7 @@ fn run(startup: &mut Startup<'_>) -> Result<ExitCode, Error> {
                 }
                 Action::Submit(line) => {
                     write_terminal(b"\n")?;
-                    match execute_line(&line, &mut authorities, input, output, error) {
+                    match execute_line(&line, &mut authorities, &input) {
                         Ok(CommandFlow::Continue) => (),
                         Ok(CommandFlow::Exit) => return Ok(ExitCode::SUCCESS),
                         Err(error) => write_terminal(format!("sh: {error}\n").as_bytes())?,
@@ -162,9 +172,7 @@ fn run(startup: &mut Startup<'_>) -> Result<ExitCode, Error> {
 fn execute_line(
     bytes: &[u8],
     authorities: &mut CommandAuthorities,
-    input: &OwnedHandle<ByteChannelObject>,
-    output: &OwnedHandle<ByteChannelObject>,
-    error: &OwnedHandle<ByteChannelObject>,
+    input: &Inherited,
 ) -> Result<CommandFlow, Error> {
     let pipeline = match Pipeline::parse(bytes) {
         Ok(command) => command,
@@ -185,7 +193,7 @@ fn execute_line(
         || !stage.redirects.is_empty()
         || !matches!(name, "cd" | "pwd" | "clear" | "exit" | "help")
     {
-        launch_pipeline(&pipeline, bytes, authorities, input, output, error)?;
+        launch_pipeline(&pipeline, bytes, authorities, input)?;
         return Ok(CommandFlow::Continue);
     }
     let builtin = match Builtin::try_parse_from(std::iter::once("sh").chain(command.arguments())) {
@@ -271,6 +279,7 @@ struct CommandAuthorities {
     cpu_inspector: OwnedHandle<CpuInspectorObject>,
     vm_connection: Option<CapabilityChannel>,
     filesystem_control: Option<OwnedHandle<CapabilityChannelObject>>,
+    terminal: Option<hyper_terminal::Terminal>,
 }
 
 enum CommandFlow {
