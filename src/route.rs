@@ -3,25 +3,23 @@
 
 //! Bounded file/terminal adapters. Pipeline edges themselves connect children.
 use crate::Error;
+use crate::reactor::Source;
 use hyper_os::channel;
 use hyper_os::handle::{ByteChannelObject, OwnedHandle};
-use hyper_os::wait::{ObjectSignals, WaitItem};
+use hyper_os::wait::ObjectSignals;
 use hyper_os::{Error as OsError, Status};
-use std::fs::File;
-use std::io::{Read, Write};
+use hyper_shell::interpreter::io::Port;
 
 type Channel = OwnedHandle<ByteChannelObject>;
 pub enum Endpoint {
     Owned(Channel),
-    Terminal,
-    File(File),
+    Data(Port),
 }
 impl Endpoint {
     fn channel(&self) -> Option<&Channel> {
         match self {
             Self::Owned(c) => Some(c),
-            Self::Terminal => None,
-            Self::File(_) => None,
+            Self::Data(_) => None,
         }
     }
 }
@@ -69,9 +67,9 @@ impl Route {
                 self.finish();
                 return Ok(true);
             };
-            let file_source = matches!(source, Endpoint::File(_));
+            let file_source = matches!(source, Endpoint::Data(_));
             let count = match source {
-                Endpoint::File(file) => file.read(&mut self.buffer).map_err(Error::Io)?,
+                Endpoint::Data(port) => port.read(&mut self.buffer).map_err(Error::Message)?,
                 source => match source
                     .channel()
                     .ok_or(Error::Protocol)?
@@ -96,18 +94,9 @@ impl Route {
             self.pending = count;
         }
         match self.destination.as_mut().ok_or(Error::Protocol)? {
-            Endpoint::File(file) => file
-                .write_all(&self.buffer[..self.pending])
-                .map_err(Error::Io)?,
-            Endpoint::Terminal => {
-                let mut output = std::io::stdout().lock();
-                output
-                    .write_all(&self.buffer[..self.pending])
-                    .map_err(Error::Io)?;
-                // A relayed child prompt need not end in LF. Do not retain it
-                // in this shell's line buffer while the child waits for input.
-                output.flush().map_err(Error::Io)?;
-            }
+            Endpoint::Data(port) => port
+                .write(&self.buffer[..self.pending])
+                .map_err(Error::Message)?,
             destination => match destination
                 .channel()
                 .ok_or(Error::Protocol)?
@@ -126,7 +115,7 @@ impl Route {
         self.pending = 0;
         Ok(true)
     }
-    pub fn wait_item(&self) -> Option<WaitItem<'_>> {
+    pub fn wait_item(&self) -> Option<Source<'_>> {
         let endpoint = if self.pending == 0 {
             self.source.as_ref()?
         } else {
@@ -138,7 +127,7 @@ impl Route {
         } else {
             ObjectSignals::<ByteChannelObject>::WRITABLE
         };
-        Some(WaitItem::new(
+        Some(Source::Channel(
             channel.as_handle_ref(),
             signal.union(ObjectSignals::<ByteChannelObject>::PEER_CLOSED),
         ))

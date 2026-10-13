@@ -29,7 +29,7 @@ fn recall_restores_draft_and_does_not_mutate_saved_commands() {
 #[test]
 fn history_is_bounded_and_omits_private_duplicate_and_overlong_lines() {
     let mut editor = Editor::default();
-    for index in 0..40 {
+    for index in 0..HISTORY_LINES + 8 {
         type_bytes(&mut editor, format!("echo {index}\n").as_bytes());
     }
     assert_eq!(editor.history.len(), HISTORY_LINES);
@@ -37,13 +37,16 @@ fn history_is_bounded_and_omits_private_duplicate_and_overlong_lines() {
         editor.history.front().map(Vec::as_slice),
         Some(b"echo 8".as_slice())
     );
-    type_bytes(&mut editor, b"echo 39\n secret\n\n");
+    type_bytes(
+        &mut editor,
+        format!("echo {}\n secret\n\n", HISTORY_LINES + 7).as_bytes(),
+    );
     assert_eq!(editor.history.len(), HISTORY_LINES);
     type_bytes(&mut editor, &vec![b'x'; MAX_LINE_BYTES + 1]);
     assert!(matches!(editor.push(b'\n'), Action::TooLong));
     assert_eq!(
         editor.history.back().map(Vec::as_slice),
-        Some(b"echo 39".as_slice())
+        Some(format!("echo {}", HISTORY_LINES + 7).as_bytes())
     );
 }
 
@@ -65,4 +68,33 @@ fn split_escape_crlf_cancel_and_utf8_backspace() {
     editor.push(21);
     assert!(editor.line().is_empty());
     assert!(matches!(editor.push(4), Action::Exit));
+}
+
+#[test]
+fn unicode_cursor_kill_yank_and_paste_do_not_execute() {
+    let mut e = Editor::default();
+    type_bytes(&mut e, "a中b".as_bytes());
+    type_bytes(&mut e, b"\x1b[D\x7f");
+    assert_eq!(e.line(), b"ab");
+    type_bytes(&mut e, b"\x01\x06\x0b\x19");
+    assert_eq!(e.line(), b"ab");
+    e.push(3);
+    for b in b"\x1b[200~echo a\r\necho b\x1b[201~" {
+        assert!(!matches!(e.push(*b), Action::Submit(_)));
+    }
+    assert_eq!(e.line(), b"echo a\necho b");
+    assert!(matches!(e.push(b'\r'), Action::Submit(_)));
+}
+
+#[test]
+fn reverse_search_accepts_or_restores_the_draft() {
+    let mut e = Editor::default();
+    e.set_history(&["echo one".into(), "echo two".into()]);
+    type_bytes(&mut e, b"draft\x12one");
+    assert_eq!(e.line(), b"echo one");
+    e.push(7);
+    assert_eq!(e.line(), b"draft");
+    type_bytes(&mut e, b"\x12two\r");
+    assert_eq!(e.line(), b"echo two");
+    assert!(matches!(e.push(b'\r'), Action::Submit(_)));
 }

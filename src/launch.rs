@@ -2,559 +2,347 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Capability-preserving pipeline construction and foreground supervision.
-use super::{CommandAuthorities, Error, WORKING_DIRECTORY_RIGHTS, write_terminal};
+use super::capabilities::{ChildChannels, prepare_command};
+use super::{CommandAuthorities, Error, WORKING_DIRECTORY_RIGHTS};
+use crate::reactor::{self, Source};
 use crate::route;
-use hyper_os::capability_channel::{CapabilityChannel, CapabilityDisposition};
 use hyper_os::channel;
 use hyper_os::handle::{
     ByteChannelObject, CapabilityChannelObject, OwnedHandle, ProcessObject, Rights, RightsOffer,
 };
 use hyper_os::startup;
-use hyper_os::task::{ProcessBuilder, ProcessInfo, ProcessTermination};
-use hyper_os::wait::{ObjectSignals, WaitItem, wait_many};
-use hyper_os::{Error as OsError, Status};
+use hyper_os::task::ProcessTermination;
 use hyper_service::stdio::{Inherited, StandardStream};
-use hyper_service::{filesystem, process, stdio, vm};
-use hyper_shell::command::{CommandLine, Pipeline};
-use hyper_shell::program::{Authority, ImageSource, Program, RuntimeEnvironment};
+use hyper_shell::interpreter::io::Port;
+use hyper_shell::interpreter::{Backend, Invocation, Stage};
 
-fn prepare_command(
-    command: &CommandLine,
-    source: &[u8],
-    authorities: &CommandAuthorities,
-    child: ChildChannels,
-) -> Result<ProcessBuilder, Error> {
-    let name = command.argument(0).ok_or(Error::InvalidCommand)?;
-    let program =
-        Program::resolve(name, &authorities.current_path).map_err(|_| Error::InvalidCommand)?;
-    let image_directory = match program.source {
-        ImageSource::Environment => &authorities.environment,
-        ImageSource::Namespace => &authorities.root_directory,
-    };
-    let executable = match image_directory.open(
-        &program.path,
-        hyper_service::process::EXECUTABLE_FILE_RIGHTS,
-    ) {
-        Ok(executable) => executable,
-        Err(open_error) => {
-            let reason = if matches!(open_error, OsError::Status(Status::NOT_FOUND)) {
-                "command not found"
-            } else {
-                "cannot open command"
-            };
-            write_terminal(
-                format!(
-                    "sh: {reason}: {name:?} (input: \"{}\"; {open_error:?})\n",
-                    source.escape_ascii()
-                )
-                .as_bytes(),
-            )?;
-            return Err(Error::InvalidCommand);
-        }
-    };
-    // Commands outside the recovery tree use the full loader even for static ELF.
-    // Keep recovery independent of the mounted system and its loader.
-    // Resolve /system only when starting a system command. A directory opened
-    // before storage mounts would keep naming the covered RAM directory.
-    let system_environment = match program.environment {
-        RuntimeEnvironment::Recovery => None,
-        RuntimeEnvironment::System => Some(
-            process::open_environment(&authorities.root_directory, "/system")
-                .map_err(Error::from)?,
-        ),
-    };
-    let system_libraries = system_environment
-        .as_ref()
-        .map(process::open_library_directory)
-        .transpose()
-        .map_err(Error::from)?;
-    let command_loader = system_environment
-        .as_ref()
-        .map(|environment| process::open_loader(environment, process::LoaderKind::Dynamic))
-        .transpose()
-        .map_err(Error::from)?;
-    let loader = command_loader.as_ref().unwrap_or(&authorities.loader);
-    let builder = ProcessBuilder::create(
-        authorities.factory.as_handle_ref(),
-        authorities.group.as_handle_ref(),
-        authorities.domain.as_handle_ref(),
-        executable.as_handle_ref(),
-        loader.as_handle_ref(),
-    )
-    .map_err(Error::from)?;
-    if program.is_shell() {
-        process::ShellDelegation {
-            environment: authorities.environment.as_handle_ref(),
-            loader: authorities.loader.as_handle_ref(),
-            libraries: authorities.library_directory.as_handle_ref(),
-            tasks: authorities.task_inspector.as_handle_ref(),
-            objects: authorities.object_inspector.as_handle_ref(),
-            memory: authorities.memory_inspector.as_handle_ref(),
-            cpus: authorities.cpu_inspector.as_handle_ref(),
-            filesystem: authorities
-                .filesystem_control
-                .as_ref()
-                .map(OwnedHandle::as_handle_ref),
-            virtual_machines: authorities
-                .vm_connection
-                .as_ref()
-                .map(CapabilityChannel::as_handle_ref),
-        }
-        .add_to(&builder)?;
-    } else {
-        builder.add_handle_duplicate(
-            loader.as_handle_ref(),
-            process::CHILD_LOADER.as_raw(),
-            RightsOffer::Exact(process::CHILD_LOADER_CONTRACT.allowed_rights()),
-        )?;
-    }
-    builder.set_name(name).map_err(Error::from)?;
-    for index in 0..command.len() {
-        builder
-            .add_argument(command.argument(index).ok_or(Error::InvalidCommand)?)
-            .map_err(Error::from)?;
-    }
-    builder
-        .add_handle_duplicate(
-            system_libraries
-                .as_ref()
-                .unwrap_or(&authorities.library_directory)
-                .as_handle_ref(),
-            startup::DYNAMIC_LIBRARY_DIRECTORY.as_raw(),
-            RightsOffer::Exact(
-                Rights::READ
-                    .union(Rights::EXECUTE)
-                    .union(Rights::PROTECT)
-                    .union(Rights::DUPLICATE)
-                    .union(Rights::TRANSFER),
-            ),
-        )
-        .map_err(|_| Error::InvalidCommand)?;
-    builder
-        .add_handle_duplicate(
-            authorities.current_directory.as_handle_ref(),
-            process::WORKING_DIRECTORY.as_raw(),
-            RightsOffer::Exact(WORKING_DIRECTORY_RIGHTS.as_rights()),
-        )
-        .map_err(|_| Error::InvalidCommand)?;
+// Private shell-to-shell state transfer. Large scripts do not consume argv,
+// environment space, a temporary filesystem file, or the command's stdin.
+pub(super) const WORKER_STATE: startup::StartupPurpose<ByteChannelObject> =
+    startup::StartupPurpose::new(0x800a_0001);
 
-    builder
-        .add_handle_duplicate(
-            authorities.root_directory.as_handle_ref(),
-            startup::ROOT_DIRECTORY.as_raw(),
-            RightsOffer::Exact(WORKING_DIRECTORY_RIGHTS.as_rights()),
-        )
-        .map_err(|_| Error::InvalidCommand)?;
-    builder
-        .add_handle_duplicate(
-            authorities.factory.as_handle_ref(),
-            startup::TASK_FACTORY.as_raw(),
-            RightsOffer::Exact(
-                Rights::CREATE_PROCESS
-                    .union(Rights::DUPLICATE)
-                    .union(Rights::TRANSFER),
-            ),
-        )
-        .map_err(|_| Error::InvalidCommand)?;
-    builder
-        .add_handle_duplicate(
-            authorities.group.as_handle_ref(),
-            startup::TASK_GROUP.as_raw(),
-            RightsOffer::Exact(
-                Rights::TASK_GROUP_ATTACH_PROCESS
-                    .union(Rights::DUPLICATE)
-                    .union(Rights::TRANSFER),
-            ),
-        )
-        .map_err(|_| Error::InvalidCommand)?;
-    builder
-        .add_handle_duplicate(
-            authorities.domain.as_handle_ref(),
-            startup::RESOURCE_DOMAIN.as_raw(),
-            RightsOffer::Exact(
-                Rights::RESOURCE_DOMAIN_SPONSOR
-                    .union(Rights::DUPLICATE)
-                    .union(Rights::TRANSFER),
-            ),
-        )
-        .map_err(|_| Error::InvalidCommand)?;
-    child.input.add_to(&builder, StandardStream::Input)?;
-    if let Some((control, events)) = child.terminal {
-        builder
-            .add_handle_move(
-                control,
-                hyper_terminal::client::CONTROL.as_raw(),
-                RightsOffer::Exact(hyper_terminal::client::CONTROL_RIGHTS),
-            )
-            .map_err(|failure| failure.error())?;
-        builder
-            .add_handle_move(
-                events,
-                hyper_terminal::client::EVENTS.as_raw(),
-                RightsOffer::Exact(hyper_terminal::client::EVENT_RIGHTS),
-            )
-            .map_err(|failure| failure.error())?;
-    }
-    child.output.add_to(&builder, StandardStream::Output)?;
-    match program.authority {
-        Some(Authority::Filesystem) => {
-            if let Some(control) = authorities.filesystem_control.as_ref() {
-                builder
-                    .add_handle_duplicate(
-                        control.as_handle_ref(),
-                        filesystem::CONTROL_CLIENT.as_raw(),
-                        RightsOffer::Exact(Rights::WAIT.union(Rights::WRITE)),
-                    )
-                    .map_err(|_| Error::InvalidCommand)?;
-            }
-        }
-        Some(Authority::Tasks) => builder
-            .add_handle_duplicate(
-                authorities.task_inspector.as_handle_ref(),
-                startup::TASK_INSPECTOR.as_raw(),
-                RightsOffer::Exact(Rights::INSPECT),
-            )
-            .map_err(|_| Error::InvalidCommand)?,
-        Some(Authority::Handles) => {
-            builder
-                .add_handle_duplicate(
-                    authorities.object_inspector.as_handle_ref(),
-                    startup::OBJECT_INSPECTOR.as_raw(),
-                    RightsOffer::Exact(Rights::INSPECT.union(Rights::INSPECT_DETAILS)),
-                )
-                .map_err(|_| Error::InvalidCommand)?;
-            builder
-                .add_handle_duplicate(
-                    authorities.task_inspector.as_handle_ref(),
-                    startup::TASK_INSPECTOR.as_raw(),
-                    RightsOffer::Exact(Rights::INSPECT),
-                )
-                .map_err(|_| Error::InvalidCommand)?;
-        }
-        Some(Authority::Memory) => builder
-            .add_handle_duplicate(
-                authorities.memory_inspector.as_handle_ref(),
-                startup::MEMORY_INSPECTOR.as_raw(),
-                RightsOffer::Exact(Rights::INSPECT),
-            )
-            .map_err(|_| Error::InvalidCommand)?,
-        Some(Authority::Activity) => {
-            builder
-                .add_handle_duplicate(
-                    authorities.task_inspector.as_handle_ref(),
-                    startup::TASK_INSPECTOR.as_raw(),
-                    RightsOffer::Exact(Rights::INSPECT),
-                )
-                .map_err(|_| Error::InvalidCommand)?;
-            builder
-                .add_handle_duplicate(
-                    authorities.memory_inspector.as_handle_ref(),
-                    startup::MEMORY_INSPECTOR.as_raw(),
-                    RightsOffer::Exact(Rights::INSPECT),
-                )
-                .map_err(|_| Error::InvalidCommand)?;
-            builder
-                .add_handle_duplicate(
-                    authorities.cpu_inspector.as_handle_ref(),
-                    startup::CPU_INSPECTOR.as_raw(),
-                    RightsOffer::Exact(Rights::INSPECT),
-                )
-                .map_err(|_| Error::InvalidCommand)?;
-        }
-        Some(Authority::VirtualMachines) if authorities.vm_connection.is_some() => {
-            let (client_control, manager_control) = channel::create_pair().map_err(Error::from)?;
-            let (manager_capabilities, client_capabilities) =
-                CapabilityChannel::create().map_err(Error::from)?;
-            connect_vm_manager(
-                authorities
-                    .vm_connection
-                    .as_ref()
-                    .ok_or(Error::InvalidCommand)?,
-                manager_control,
-                manager_capabilities,
-            )?;
-            add_child_channel(
-                &builder,
-                client_control,
-                vm::CLIENT_CONTROL.as_raw(),
-                vm::CLIENT_CONTROL_CONTRACT.required_rights(),
-            )?;
-            builder
-                .add_handle_move(
-                    client_capabilities.into_handle(),
-                    vm::CLIENT_CAPABILITIES.as_raw(),
-                    RightsOffer::Exact(vm::CLIENT_CAPABILITIES_CONTRACT.required_rights()),
-                )
-                .map_err(|failure| Error::from(failure.error()))?;
-        }
-        _ => {}
-    }
-    child.error.add_to(&builder, StandardStream::Error)?;
-    builder.seal().map_err(Error::from)?;
-    Ok(builder)
+#[derive(Default)]
+struct Adapters {
+    routes: Vec<route::Route>,
+    inputs: Vec<crate::input::Input>,
 }
 
-pub(super) fn launch_pipeline(
-    pipeline: &Pipeline,
-    source: &[u8],
-    authorities: &mut CommandAuthorities,
-    input: &Inherited,
-) -> Result<(), Error> {
-    let mut lease = None;
-    let result = launch_pipeline_inner(pipeline, source, authorities, input, &mut lease);
-    if let (Some(id), Some(terminal)) = (lease, authorities.terminal.as_mut()) {
-        let cleanup = terminal.release_child(id).map_err(Error::from);
-        if result.is_ok() {
-            cleanup?;
-        }
-    }
-    result
+pub(super) struct NativeBackend {
+    pub authorities: CommandAuthorities,
+    pub input: Inherited,
+    pub output: Inherited,
+    pub error: Inherited,
+    pub read_settings: Option<hyper_terminal::Settings>,
 }
 
-fn launch_pipeline_inner(
-    pipeline: &Pipeline,
-    source: &[u8],
-    authorities: &mut CommandAuthorities,
-    input: &Inherited,
-    terminal_lease: &mut Option<u64>,
-) -> Result<(), Error> {
-    use route::{Endpoint, Route};
-    // Reject state-changing builtins before opening/truncating any redirects.
-    for stage in &pipeline.0 {
-        if matches!(stage.command.argument(0), Some("cd" | "exit")) {
-            write_terminal(b"sh: cd and exit require a standalone command without redirection\n")?;
+impl Backend for NativeBackend {
+    fn canonical_input(&mut self, enabled: bool) -> Result<(), String> {
+        let Some(terminal) = self.authorities.terminal.as_mut() else {
             return Ok(());
+        };
+        if enabled {
+            let settings = terminal
+                .settings()
+                .map_err(|e| format!("terminal settings: {e:?}"))?;
+            terminal
+                .set_settings(hyper_terminal::Settings::default())
+                .map_err(|e| format!("terminal canonical input: {e:?}"))?;
+            self.read_settings = Some(settings);
+        } else if let Some(settings) = self.read_settings.take() {
+            terminal
+                .set_settings(settings)
+                .map_err(|e| format!("terminal restore: {e:?}"))?;
         }
+        Ok(())
     }
-    let mut routes = Vec::new();
-    let mut builders = Vec::new();
+    fn directory(&mut self, target: &str) -> Result<(), String> {
+        let path = self
+            .authorities
+            .current_path
+            .resolve(target)
+            .map_err(|_| "invalid directory path")?;
+        let text = path.as_str().map_err(|_| "invalid directory path")?;
+        let directory = if text == "/" {
+            self.authorities
+                .root_directory
+                .scope_at(&self.authorities.root_directory, WORKING_DIRECTORY_RIGHTS)
+        } else {
+            self.authorities
+                .root_directory
+                .open_directory(text, WORKING_DIRECTORY_RIGHTS)
+        }
+        .map_err(|e| format!("{text}: {e:?}"))?;
+        self.authorities.current_directory = directory;
+        self.authorities.current_path = path;
+        Ok(())
+    }
 
-    let mut next_input = None;
-    for (index, stage) in pipeline.0.iter().enumerate() {
-        let last = index + 1 == pipeline.0.len();
-        let (mut child_output, following_input) = channel::create_pair()?;
-        let mut child_input = next_input.take().map(Inherited::Pipe);
-        let mut terminal_caps = None;
-        let mut terminal_output = None;
-        let (child_error, parent_error) = channel::create_pair()?;
-        let mut input_file = None;
-        let mut output_file = None;
-        let mut error_file = None;
-        // Left-to-right opening preserves truncation side effects of earlier
-        // redirects. Only the final destination for each stream is retained.
-        for redirect in &stage.redirects {
-            let path = authorities
-                .current_path
-                .resolve(&redirect.path)
-                .map_err(|_| Error::InvalidCommand)?;
-            let path = path.as_str().map_err(|_| Error::InvalidCommand)?;
-            let file = if redirect.stream == 0 {
-                std::fs::File::open(path)
-            } else {
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .append(redirect.append)
-                    .truncate(!redirect.append)
-                    .open(path)
-            }
-            .map_err(Error::Io)?;
-            match redirect.stream {
-                0 => input_file = Some(file),
-                1 => output_file = Some(file),
-                _ => error_file = Some(file),
+    fn pipeline(&mut self, stages: Vec<Stage>) -> Result<Vec<i32>, String> {
+        let mut lease = None;
+        let result = self.launch(stages, &mut lease);
+        if let (Some(id), Some(terminal)) = (lease, self.authorities.terminal.as_mut()) {
+            let cleanup = terminal.release_child(id);
+            if result.is_ok() {
+                cleanup.map_err(|e| format!("terminal release: {e:?}"))?;
             }
         }
-        if let Some(file) = input_file {
-            let (parent, child) = channel::create_pair()?;
-            child_input = Some(Inherited::Pipe(child));
-            routes.push(Route::new(
-                Endpoint::File(file),
-                Endpoint::Owned(parent),
-                None,
-                Some(index),
-            ));
-        } else if index == 0 {
-            // A prepared child gets its own reader connector. No input is
-            // consumed until the child actually issues a read after binding.
-            if let Some(terminal) = authorities.terminal.as_mut() {
+        result.map_err(|e| e.to_string())
+    }
+}
+
+impl NativeBackend {
+    fn launch(&mut self, stages: Vec<Stage>, lease: &mut Option<u64>) -> Result<Vec<i32>, Error> {
+        let mut adapters = Adapters::default();
+        let mut descriptors = Vec::new();
+        let mut builders = Vec::new();
+        let mut pipes = Vec::new();
+        for _ in 1..stages.len() {
+            pipes.push(channel::create_pair()?);
+        }
+        let mut lease_owner = None;
+        for (index, stage) in stages.into_iter().enumerate() {
+            let client = if matches!(stage.streams.get(0), Port::Standard(0))
+                && self.authorities.terminal.is_some()
+                && lease.is_none()
+            {
+                let terminal = self.authorities.terminal.as_mut().ok_or(Error::Protocol)?;
                 let client = terminal.prepare_child()?;
-                *terminal_lease = Some(client.id);
-                terminal_output = Some(
-                    client
-                        .stream
-                        .duplicate(hyper_os::stream::CONNECTOR_RIGHTS)?,
-                );
-                child_input = Some(Inherited::Stream(client.stream));
-                terminal_caps = Some((client.control, client.events));
+                *lease = Some(client.id);
+                lease_owner = Some(index);
+                Some(client)
             } else {
-                child_input = Some(input.duplicate(StandardStream::Input)?);
+                None
+            };
+            let terminal_stream = client.as_ref().map(|c| &c.stream);
+            let child_input = self.endpoint(
+                stage.streams.get(0),
+                0,
+                index,
+                &pipes,
+                terminal_stream,
+                &mut adapters,
+            )?;
+            let child_output = self.endpoint(
+                stage.streams.get(1),
+                1,
+                index,
+                &pipes,
+                terminal_stream,
+                &mut adapters,
+            )?;
+            let child_error = if stage.streams.get(2).aliases(&stage.streams.get(1)) {
+                child_output.duplicate(StandardStream::Error)?
+            } else {
+                self.endpoint(
+                    stage.streams.get(2),
+                    2,
+                    index,
+                    &pipes,
+                    terminal_stream,
+                    &mut adapters,
+                )?
+            };
+            let terminal = client.map(|c| (c.control, c.events));
+            let mut descriptor_child = None;
+            let (arguments, environment, payload) = match stage.invocation {
+                Invocation::External {
+                    arguments,
+                    environment,
+                } => (arguments, environment, None),
+                Invocation::Shell(mut worker) => {
+                    // Keep aliases of inherited standard streams local to the
+                    // worker. In particular, a terminal reader must use the
+                    // child's lease, never call back into the inactive parent.
+                    worker.aliases = stage
+                        .streams
+                        .0
+                        .iter()
+                        .filter(|(fd, port)| **fd > 2 && !matches!(port, Port::Closed))
+                        .filter_map(|(fd, port)| {
+                            (0..3)
+                                .find(|n| port.aliases(&stage.streams.get(*n)))
+                                .map(|source| (*fd, source))
+                        })
+                        .collect();
+                    worker.descriptors = stage
+                        .streams
+                        .0
+                        .iter()
+                        .filter(|(fd, port)| {
+                            **fd > 2
+                                && !matches!(port, Port::Closed)
+                                && !worker.aliases.iter().any(|(alias, _)| alias == *fd)
+                        })
+                        .map(|(fd, _)| *fd)
+                        .collect();
+                    if !worker.descriptors.is_empty() {
+                        let (parent, child) = channel::create_pair()?;
+                        descriptors.push(crate::descriptor::Server::new(
+                            index,
+                            parent,
+                            stage.streams.clone(),
+                        ));
+                        descriptor_child = Some(child);
+                    }
+                    let bytes =
+                        serde_json::to_vec(&worker).map_err(|e| Error::Message(e.to_string()))?;
+                    if bytes.len() > hyper_shell::syntax::MAX_SCRIPT_BYTES {
+                        return Err(Error::Message("shell worker state limit exceeded".into()));
+                    }
+                    (
+                        vec!["/system/bin/sh".into(), "--worker".into()],
+                        worker.state.environment(),
+                        Some(bytes),
+                    )
+                }
+            };
+            let builder = prepare_command(
+                &arguments,
+                &environment,
+                &self.authorities,
+                ChildChannels {
+                    input: child_input,
+                    output: child_output,
+                    error: child_error,
+                    terminal,
+                },
+            )?;
+            if let Some(bytes) = payload {
+                let (parent, child) = channel::create_pair()?;
+                builder
+                    .add_handle_move(
+                        child,
+                        WORKER_STATE.as_raw(),
+                        RightsOffer::Exact(Rights::READ.union(Rights::WAIT)),
+                    )
+                    .map_err(|e| e.error())?;
+                adapters.routes.push(route::Route::new(
+                    route::Endpoint::Data(Port::memory(bytes)),
+                    route::Endpoint::Owned(parent),
+                    None,
+                    Some(index),
+                ));
+            }
+            if let Some(child) = descriptor_child {
+                builder
+                    .add_handle_move(
+                        child,
+                        crate::descriptor::CONNECTOR.as_raw(),
+                        RightsOffer::Exact(Rights::READ.union(Rights::WRITE).union(Rights::WAIT)),
+                    )
+                    .map_err(|e| e.error())?;
+            }
+            builder.seal()?;
+            builders.push(builder);
+        }
+        // Only children retain pipe edges once launched. Keeping a parent end
+        // would prevent downstream EOF and can deadlock a finite pipeline.
+        drop(pipes);
+        let mut running = Running(Vec::new());
+        for (index, builder) in builders.into_iter().enumerate() {
+            running.0.push(builder.start().map_err(|e| e.error())?);
+            if lease_owner == Some(index)
+                && let (Some(id), Some(terminal)) = (*lease, self.authorities.terminal.as_mut())
+            {
+                let process = running.0.last().ok_or(Error::Protocol)?;
+                terminal.bind_child(id, process.as_process_supervisor().observe()?)?;
             }
         }
-        let direct_output = last && output_file.is_none() && terminal_output.is_some();
-        if let Some(file) = output_file {
-            let (child, parent) = channel::create_pair()?;
-            child_output = child;
-            routes.push(Route::new(
-                Endpoint::Owned(parent),
-                Endpoint::File(file),
-                Some(index),
-                None,
-            ));
-        }
-        let child_error = if error_file.is_none() && terminal_output.is_some() {
-            drop(child_error);
-            drop(parent_error);
-            Inherited::Stream(
-                terminal_output
-                    .as_ref()
+        relay_pipeline(
+            &running.0,
+            &mut adapters.routes,
+            &mut descriptors,
+            &mut adapters.inputs,
+        )
+    }
+
+    fn endpoint(
+        &self,
+        port: Port,
+        fd: u8,
+        index: usize,
+        pipes: &[(
+            OwnedHandle<ByteChannelObject>,
+            OwnedHandle<ByteChannelObject>,
+        )],
+        terminal: Option<&OwnedHandle<CapabilityChannelObject>>,
+        adapters: &mut Adapters,
+    ) -> Result<Inherited, Error> {
+        let rights = Rights::WAIT
+            .union(Rights::DUPLICATE)
+            .union(Rights::TRANSFER)
+            .union(if fd == 0 { Rights::READ } else { Rights::WRITE });
+        match port {
+            Port::Pipe { edge, reading } => {
+                let pair = pipes.get(edge).ok_or(Error::Protocol)?;
+                let handle = if reading { &pair.1 } else { &pair.0 };
+                Ok(Inherited::Pipe(handle.duplicate(rights)?))
+            }
+            Port::Standard(0) if fd == 0 => {
+                if let Some(terminal) = terminal {
+                    Ok(Inherited::Stream(
+                        terminal.duplicate(hyper_os::stream::CONNECTOR_RIGHTS)?,
+                    ))
+                } else {
+                    Ok(self.input.duplicate(StandardStream::Input)?)
+                }
+            }
+            Port::Standard(1 | 2) if terminal.is_some() => Ok(Inherited::Stream(
+                terminal
                     .ok_or(Error::Protocol)?
                     .duplicate(hyper_os::stream::CONNECTOR_RIGHTS)?,
-            )
-        } else {
-            routes.push(Route::new(
-                Endpoint::Owned(parent_error),
-                error_file.map_or(Endpoint::Terminal, Endpoint::File),
-                Some(index),
-                None,
-            ));
-            Inherited::Pipe(child_error)
-        };
-        let child_output = if direct_output {
-            drop(child_output);
-            Inherited::Stream(terminal_output.take().ok_or(Error::Protocol)?)
-        } else {
-            Inherited::Pipe(child_output)
-        };
-        let builtin = matches!(stage.command.argument(0), Some("pwd" | "clear" | "help"));
-        let worker;
-        let command = if builtin {
-            let mut words = vec!["sh".to_owned(), "--builtin".to_owned()];
-            words.extend(stage.command.arguments().map(str::to_owned));
-            worker = CommandLine::parse(
-                shlex::try_join(words.iter().map(String::as_str))
-                    .map_err(|_| Error::InvalidCommand)?
-                    .as_bytes(),
-            )
-            .map_err(|_| Error::InvalidCommand)?;
-            &worker
-        } else {
-            &stage.command
-        };
-        builders.push(prepare_command(
-            command,
-            source,
-            authorities,
-            ChildChannels {
-                input: child_input.ok_or(Error::Protocol)?,
-                terminal: terminal_caps,
-                output: child_output,
-                error: child_error,
-            },
-        )?);
-        next_input = Some(following_input);
-        if last && !direct_output {
-            routes.push(Route::new(
-                Endpoint::Owned(next_input.take().ok_or(Error::Protocol)?),
-                Endpoint::Terminal,
-                Some(index),
-                None,
-            ));
+            )),
+            // Unredirected output keeps its original transport. Relaying stdout
+            // and stderr independently at every nested shell lets a later
+            // stdout prompt overtake already-written stderr fragments.
+            Port::Standard(1) => self
+                .output
+                .duplicate(StandardStream::Output)
+                .map_err(Into::into),
+            Port::Standard(2) => self
+                .error
+                .duplicate(StandardStream::Error)
+                .map_err(Into::into),
+            Port::Closed => {
+                let (child, parent) = channel::create_pair()?;
+                drop(parent);
+                Ok(Inherited::Pipe(child))
+            }
+            port if fd == 0 => {
+                let input = crate::input::Input::new(index, port)?;
+                let child = input.connector()?;
+                adapters.inputs.push(input);
+                Ok(Inherited::Stream(child))
+            }
+            port => {
+                let (child, parent) = channel::create_pair()?;
+                adapters.routes.push(route::Route::new(
+                    route::Endpoint::Owned(parent),
+                    route::Endpoint::Data(port),
+                    Some(index),
+                    None,
+                ));
+                Ok(Inherited::Pipe(child))
+            }
         }
     }
-    drop(next_input);
-    let mut running = Running(Vec::new());
-    for (index, builder) in builders.into_iter().enumerate() {
-        let process = builder
-            .start()
-            .map_err(|failure| Error::from(failure.error()))?;
-        running.0.push(process);
-        if index == 0
-            && let (Some(id), Some(terminal)) = (*terminal_lease, authorities.terminal.as_mut())
-        {
-            let process = running.0.last().ok_or(Error::Protocol)?;
-            terminal.bind_child(id, process.as_process_supervisor().observe()?)?;
-        }
-    }
-    relay_pipeline(&running.0, &mut routes)
 }
 
 struct Running(Vec<OwnedHandle<ProcessObject>>);
 impl Drop for Running {
     fn drop(&mut self) {
-        // Also covers a later start or relay failure after earlier stages ran.
         for process in &self.0 {
             let _ = process.as_process_supervisor().request_stop();
         }
     }
 }
 
-fn connect_vm_manager(
-    connector: &CapabilityChannel,
-    control: OwnedHandle<ByteChannelObject>,
-    capabilities: CapabilityChannel,
-) -> Result<(), Error> {
-    let mut control = Some(control);
-    let mut capabilities = Some(capabilities.into_handle());
-    loop {
-        let waits = [WaitItem::new(
-            connector.as_handle_ref(),
-            ObjectSignals::<CapabilityChannelObject>::PEER_RECEIVING
-                .union(ObjectSignals::<CapabilityChannelObject>::PEER_CLOSED),
-        )];
-        let observation = wait_many(&waits, hyper_os::DEADLINE_INFINITE).map_err(Error::from)?;
-        if !ObjectSignals::<CapabilityChannelObject>::PEER_RECEIVING
-            .is_present_in(observation.observed)
-        {
-            return Err(Error::from(OsError::Status(Status::PEER_CLOSED)));
-        }
-        let control_disposition = CapabilityDisposition::move_handle(
-            &mut control,
-            RightsOffer::Exact(Rights::WAIT.union(Rights::READ).union(Rights::WRITE)),
-        )
-        .map_err(Error::from)?;
-        let capabilities_disposition = CapabilityDisposition::move_handle(
-            &mut capabilities,
-            RightsOffer::Exact(Rights::WAIT.union(Rights::WRITE)),
-        )
-        .map_err(Error::from)?;
-        match connector.try_send(
-            &vm::ManagerConnectionRequest.encode(),
-            &mut [control_disposition, capabilities_disposition],
-        ) {
-            Ok(()) => return Ok(()),
-            Err(OsError::Status(Status::WOULD_BLOCK)) => {}
-            Err(error) => return Err(Error::from(error)),
-        }
-    }
-}
-
-fn add_child_channel(
-    builder: &ProcessBuilder,
-    channel: OwnedHandle<ByteChannelObject>,
-    purpose: u32,
-    rights: Rights,
-) -> Result<(), Error> {
-    let rights = if [
-        stdio::STANDARD_INPUT.as_raw(),
-        stdio::STANDARD_OUTPUT.as_raw(),
-        stdio::STANDARD_ERROR.as_raw(),
-    ]
-    .contains(&purpose)
-    {
-        rights.union(Rights::DUPLICATE).union(Rights::TRANSFER)
-    } else {
-        rights
-    };
-    builder
-        .add_handle_move(channel, purpose, RightsOffer::Exact(rights))
-        .map_err(|failure| Error::from(failure.error()))
-}
-
 fn relay_pipeline(
     processes: &[OwnedHandle<ProcessObject>],
     routes: &mut [route::Route],
-) -> Result<(), Error> {
+    descriptors: &mut [crate::descriptor::Server],
+    inputs: &mut [crate::input::Input],
+) -> Result<Vec<i32>, Error> {
     let mut terminated = vec![false; processes.len()];
     let mut first = 0;
     loop {
@@ -564,6 +352,20 @@ fn relay_pipeline(
             }
         }
         let mut progressed = false;
+        for input in inputs.iter_mut() {
+            if terminated[input.owner] {
+                input.finish();
+            } else {
+                progressed |= input.poll()?;
+            }
+        }
+        for descriptor in descriptors.iter_mut() {
+            if terminated[descriptor.owner] {
+                descriptor.finish();
+            } else {
+                progressed |= descriptor.poll()?;
+            }
+        }
         for offset in 0..routes.len() {
             let index = (first + offset) % routes.len();
             let route = &mut routes[index];
@@ -589,12 +391,17 @@ fn relay_pipeline(
             continue;
         }
         let mut waits = Vec::new();
+        for input in inputs.iter() {
+            input.waits(&mut waits);
+        }
         for (index, process) in processes.iter().enumerate() {
             if !terminated[index] {
-                waits.push(WaitItem::new(
-                    process.as_handle_ref(),
-                    ObjectSignals::<ProcessObject>::TERMINATED,
-                ));
+                waits.push(Source::Process(process.as_handle_ref()));
+            }
+        }
+        for descriptor in descriptors.iter() {
+            if let Some(wait) = descriptor.wait_item() {
+                waits.push(wait);
             }
         }
         for route in routes.iter() {
@@ -602,33 +409,20 @@ fn relay_pipeline(
                 waits.push(wait);
             }
         }
-        wait_many(&waits, hyper_os::DEADLINE_INFINITE)?;
+        reactor::wait(&waits)?;
     }
-    if let Some(last) = processes.last()
-        && !process_succeeded(last.as_process_supervisor().info()?)
-    {
-        write_terminal(b"sh: command failed\n")?;
-    }
-    Ok(())
-}
-
-fn process_succeeded(info: ProcessInfo) -> bool {
-    matches!(
-        info.terminal,
-        Some(
-            ProcessTermination::ThreadExited { status: 0 }
-                | ProcessTermination::ProcessExited { status: 0 }
-                | ProcessTermination::LastThreadExited { status: 0 }
-        )
-    )
-}
-
-struct ChildChannels {
-    input: Inherited,
-    terminal: Option<(
-        OwnedHandle<CapabilityChannelObject>,
-        OwnedHandle<ByteChannelObject>,
-    )>,
-    output: Inherited,
-    error: Inherited,
+    processes
+        .iter()
+        .map(|process| {
+            let info = process.as_process_supervisor().info()?;
+            Ok(match info.terminal {
+                Some(
+                    ProcessTermination::ThreadExited { status }
+                    | ProcessTermination::ProcessExited { status }
+                    | ProcessTermination::LastThreadExited { status },
+                ) => (status & 255) as i32,
+                _ => 125,
+            })
+        })
+        .collect()
 }

@@ -1,15 +1,20 @@
 // SPDX-FileCopyrightText: 2026 roolrz
 // SPDX-License-Identifier: Apache-2.0
 
-//! Initial Native command shell and capability-scoped command launcher.
+//! Formal system shell. Bootstrap uses its separate byte-stream fallback shell.
 
 // Select the shared parser implementation for the formal environment.
 #[cfg(target_os = "hyper")]
 extern crate hyper_clap_shared as _;
 
+mod capabilities;
+mod descriptor;
+mod input;
+mod interactive;
 mod launch;
+mod reactor;
 mod route;
-use launch::launch_pipeline;
+use hyper_shell::interpreter::{Backend, Flow, Shell};
 
 use clap::Parser;
 use hyper_os::Error as OsError;
@@ -20,10 +25,8 @@ use hyper_os::handle::{
     OwnedHandle, ResourceDomainObject, TaskFactoryObject, TaskGroupObject, TaskInspectorObject,
 };
 use hyper_os::startup::{self, Startup};
-use hyper_service::stdio::Inherited;
+use hyper_service::stdio::{Inherited, StandardStream};
 use hyper_service::{filesystem, process, vm};
-use hyper_shell::cli::{Builtin, BuiltinCommand};
-use hyper_shell::command::Pipeline;
 use hyper_shell::editor::{Action, Editor};
 use hyper_shell::path::CanonicalPath;
 use std::io::{Read, Write};
@@ -42,29 +45,12 @@ const WORKING_DIRECTORY_RIGHTS: DirectoryRights = DirectoryRights::READ
     .union(DirectoryRights::DUPLICATE)
     .union(DirectoryRights::TRANSFER);
 
-fn application_main(mut startup: Startup<'_>) -> ExitCode {
-    match run(&mut startup) {
-        Ok(code) => code,
-        Err(_) => ExitCode::FAILURE,
-    }
-}
-
-fn run(startup: &mut Startup<'_>) -> Result<ExitCode, Error> {
+fn run(startup: &mut Startup<'_>, args: &hyper_shell::cli::Shell) -> Result<ExitCode, Error> {
     hyper_os::require_core_abi().map_err(Error::from)?;
-    let input = if let Some(stream) = hyper_rt::process::stdin_stream()? {
-        Inherited::Stream(stream.duplicate(hyper_os::stream::CONNECTOR_RIGHTS)?)
-    } else {
-        Inherited::Pipe(
-            hyper_rt::process::stdin()?
-                .duplicate(hyper_service::stdio::STANDARD_INPUT_CONTRACT.allowed_rights())?,
-        )
-    };
-    let mut terminal = hyper_terminal::Terminal::take(startup)?;
-    if let Some(terminal) = terminal.as_mut() {
-        let mut settings = hyper_terminal::Settings::raw();
-        settings.output.lf_to_crlf = true;
-        terminal.set_settings(settings)?;
-    }
+    let input = inherited_stream(StandardStream::Input)?;
+    let output = inherited_stream(StandardStream::Output)?;
+    let error = inherited_stream(StandardStream::Error)?;
+    let terminal = hyper_terminal::Terminal::take(startup)?;
     let root_directory = startup.take_root_directory().map_err(Error::from)?;
     let environment = Directory::from_handle(
         startup
@@ -102,7 +88,7 @@ fn run(startup: &mut Startup<'_>) -> Result<ExitCode, Error> {
     let filesystem_control = startup
         .take_optional(filesystem::CONTROL_CLIENT)
         .map_err(Error::from)?;
-    let mut authorities = CommandAuthorities {
+    let authorities = CommandAuthorities {
         root_directory,
         environment,
         current_directory,
@@ -121,139 +107,304 @@ fn run(startup: &mut Startup<'_>) -> Result<ExitCode, Error> {
         terminal,
     };
 
+    let mut state = hyper_shell::interpreter::State::default();
+    for (name, value) in std::env::vars() {
+        if hyper_shell::syntax::identifier(&name) {
+            state.variables.insert(
+                name,
+                hyper_shell::interpreter::Variable {
+                    value,
+                    exported: true,
+                    readonly: false,
+                },
+            );
+        }
+    }
+    state.cwd = std::env::current_dir()
+        .map_err(Error::Io)?
+        .to_string_lossy()
+        .into_owned();
+    let mut shell = Shell::new(
+        state,
+        launch::NativeBackend {
+            authorities,
+            input,
+            output,
+            error,
+            read_settings: None,
+        },
+    );
+    shell
+        .backend
+        .directory(&shell.state.cwd)
+        .map_err(Error::Message)?;
+    if args.worker {
+        let channel = startup.take(launch::WORKER_STATE)?;
+        let mut bytes = Vec::new();
+        let mut chunk = [0; hyper_os::channel::MAX_MESSAGE_BYTES];
+        loop {
+            match channel.as_byte_channel().receive(&mut chunk) {
+                Ok(n) => {
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if bytes.len() > hyper_shell::syntax::MAX_SCRIPT_BYTES {
+                        return Err(Error::Protocol);
+                    }
+                }
+                Err(OsError::Status(hyper_os::Status::PEER_CLOSED)) => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let worker: hyper_shell::interpreter::Worker =
+            serde_json::from_slice(&bytes).map_err(|e| Error::Message(e.to_string()))?;
+        for (fd, source) in &worker.aliases {
+            if !(3..64).contains(fd) || *source > 2 {
+                return Err(Error::Protocol);
+            }
+            shell.streams.set(*fd, shell.streams.get(*source));
+        }
+        if !worker.descriptors.is_empty() {
+            let connector = std::rc::Rc::new(startup.take(descriptor::CONNECTOR)?);
+            for &fd in &worker.descriptors {
+                if !(3..64).contains(&fd) {
+                    return Err(Error::Protocol);
+                }
+                shell.streams.set(
+                    fd,
+                    hyper_shell::interpreter::io::Port::Remote(std::rc::Rc::new(
+                        descriptor::Remote {
+                            channel: connector.clone(),
+                            fd,
+                        },
+                    )),
+                );
+            }
+        }
+        let status = shell.worker(worker).map_err(Error::Message)?;
+        return Ok(exit_code(match shell.flow {
+            Flow::Exit(code) => code,
+            _ => status,
+        }));
+    }
+    let interactive = args.interactive
+        || args.command.is_none()
+            && args.arguments.is_empty()
+            && shell.backend.authorities.terminal.is_some();
+    if let Some(command) = &args.command {
+        if let Some(name) = args.arguments.first() {
+            shell.state.name = name.clone();
+            shell.state.positional = args.arguments[1..].to_vec();
+        }
+        return run_script(&mut shell, command, args.check);
+    }
+    if let Some(path) = args.arguments.first() {
+        shell.state.name = path.clone();
+        shell.state.positional = args.arguments[1..].to_vec();
+        let source = read_script(&shell.state.path(path))?;
+        return run_script(&mut shell, &source, args.check);
+    }
+    if !interactive {
+        let mut source = String::new();
+        std::io::stdin()
+            .take(hyper_shell::syntax::MAX_SCRIPT_BYTES as u64 + 1)
+            .read_to_string(&mut source)
+            .map_err(Error::Io)?;
+        return run_script(&mut shell, &source, args.check);
+    }
+    if let Some(terminal) = shell.backend.authorities.terminal.as_mut() {
+        let mut settings = hyper_terminal::Settings::raw();
+        settings.output.lf_to_crlf = true;
+        terminal.set_settings(settings)?;
+    }
+    interactive_shell(&mut shell)
+}
+
+fn inherited_stream(which: StandardStream) -> Result<Inherited, Error> {
+    let connector = match which {
+        StandardStream::Input => hyper_rt::process::stdin_stream()?,
+        StandardStream::Output => hyper_rt::process::stdout_stream()?,
+        StandardStream::Error => hyper_rt::process::stderr_stream()?,
+    };
+    if let Some(connector) = connector {
+        return Ok(Inherited::Stream(
+            connector.duplicate(hyper_os::stream::CONNECTOR_RIGHTS)?,
+        ));
+    }
+    let (pipe, rights) = match which {
+        StandardStream::Input => (
+            hyper_rt::process::stdin()?,
+            hyper_service::stdio::STANDARD_INPUT_CONTRACT,
+        ),
+        StandardStream::Output => (
+            hyper_rt::process::stdout()?,
+            hyper_service::stdio::STANDARD_OUTPUT_CONTRACT,
+        ),
+        StandardStream::Error => (
+            hyper_rt::process::stderr()?,
+            hyper_service::stdio::STANDARD_ERROR_CONTRACT,
+        ),
+    };
+    Ok(Inherited::Pipe(pipe.duplicate(rights.required_rights())?))
+}
+
+fn read_script(path: &str) -> Result<String, Error> {
+    let mut source = String::new();
+    std::fs::File::open(path)
+        .map_err(Error::Io)?
+        .take(hyper_shell::syntax::MAX_SCRIPT_BYTES as u64 + 1)
+        .read_to_string(&mut source)
+        .map_err(Error::Io)?;
+    Ok(source)
+}
+
+fn run_script(
+    shell: &mut Shell<launch::NativeBackend>,
+    source: &str,
+    check: bool,
+) -> Result<ExitCode, Error> {
+    if check {
+        hyper_shell::syntax::parse(source).map_err(|e| Error::Message(e.to_string()))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let code = shell.execute(source).map_err(Error::Message)?;
+    Ok(exit_code(match shell.flow {
+        Flow::Exit(code) => code,
+        _ => code,
+    }))
+}
+
+fn exit_code(code: i32) -> ExitCode {
+    ExitCode::from((code & 255) as u8)
+}
+
+fn interactive_shell(shell: &mut Shell<launch::NativeBackend>) -> Result<ExitCode, Error> {
+    let mut history = hyper_shell::history::History::load();
+    let mut editor = Editor::default();
+    editor.set_history(history.entries());
+    let mut source = String::new();
+    let mut renderer = interactive::Renderer::default();
+    if let Some(terminal) = shell.backend.authorities.terminal.as_mut() {
+        let (columns, _) = terminal.size()?;
+        renderer.columns(columns);
+    }
     write_terminal(READY_MESSAGE)?;
     write_terminal(PROMPT)?;
-
-    let mut editor = Editor::default();
-    let mut input_chunk = [0_u8; INPUT_CHUNK_BYTES];
+    write_terminal(b"\x1b[?2004h")?;
+    let mut input_chunk = [0; INPUT_CHUNK_BYTES];
     loop {
         let count = std::io::stdin().read(&mut input_chunk).map_err(Error::Io)?;
         if count == 0 {
-            return Ok(ExitCode::SUCCESS);
+            write_terminal(b"\x1b[?2004l")?;
+            return Ok(exit_code(shell.state.status));
         }
-        let bytes = input_chunk.get(..count).ok_or(Error::Protocol)?;
-        for byte in bytes.iter().copied() {
+        for byte in input_chunk[..count].iter().copied() {
+            let prompt = if source.is_empty() {
+                "hyper-sh$ "
+            } else {
+                "> "
+            };
             match editor.push(byte) {
-                Action::None => (),
-                Action::Echo(byte) => write_terminal(&[byte])?,
+                Action::None => {}
+                Action::Echo(byte) => {
+                    write_terminal(&[byte])?;
+                    renderer.track(&editor, prompt);
+                }
                 Action::Redraw | Action::ClearScreen => {
-                    // Redraw the whole line so history and multibyte deletion
-                    // do not leave stale text behind the cursor.
                     if byte == 12 {
                         write_terminal(b"\x1b[2J\x1b[H")?;
+                        renderer.reset();
                     }
-                    write_terminal(b"\r\x1b[2K")?;
-                    write_terminal(PROMPT)?;
-                    write_terminal(editor.line())?;
+                    renderer.draw(&editor, prompt)?;
+                }
+                Action::Complete => {
+                    let line = std::str::from_utf8(editor.line()).unwrap_or("");
+                    if let Some(completion) =
+                        hyper_shell::completion::complete(line, editor.cursor(), &shell.state)
+                    {
+                        if !completion.choices.is_empty() {
+                            write_terminal(b"\n")?;
+                            for choice in completion.choices {
+                                write_terminal(
+                                    format!("{}  ", interactive::display(&choice)).as_bytes(),
+                                )?;
+                            }
+                            write_terminal(b"\n")?;
+                            renderer.reset();
+                        }
+                        editor.replace(completion.start, &completion.replacement);
+                        renderer.draw(&editor, prompt)?;
+                    } else {
+                        write_terminal(b"\x07")?;
+                    }
                 }
                 Action::Submit(line) => {
-                    write_terminal(b"\n")?;
-                    match execute_line(&line, &mut authorities, &input) {
-                        Ok(CommandFlow::Continue) => (),
-                        Ok(CommandFlow::Exit) => return Ok(ExitCode::SUCCESS),
-                        Err(error) => write_terminal(format!("sh: {error}\n").as_bytes())?,
+                    write_terminal(b"\x1b[?2004l\n")?;
+                    renderer.reset();
+                    let line = match String::from_utf8(line) {
+                        Ok(line) => line,
+                        Err(_) => {
+                            source.clear();
+                            shell.state.status = 2;
+                            write_terminal(b"sh: command is not UTF-8\nhyper-sh$ \x1b[?2004h")?;
+                            continue;
+                        }
+                    };
+                    source.push_str(&line);
+                    source.push('\n');
+                    match hyper_shell::syntax::parse(&source) {
+                        Err(error) if error.incomplete => {
+                            renderer.prompt("> ");
+                            write_terminal(b"> \x1b[?2004h")?;
+                            continue;
+                        }
+                        Err(error) => {
+                            shell.state.status = 2;
+                            write_terminal(format!("sh: {error}\n").as_bytes())?;
+                        }
+                        Ok(_) => {
+                            history.push(source.trim_end_matches('\n').to_owned());
+                            shell.history = history.entries().to_vec();
+                            if let Err(error) = shell.execute(&source) {
+                                shell.state.status = 2;
+                                write_terminal(format!("sh: {error}\n").as_bytes())?;
+                            }
+                            if shell.history.is_empty() {
+                                history.clear();
+                            }
+                            // A missing or full /tmp never disables interactive history.
+                            let _ = history.save();
+                            editor.set_history(history.entries());
+                            if let Flow::Exit(code) = shell.flow {
+                                return Ok(exit_code(code));
+                            }
+                        }
                     }
+                    source.clear();
                     write_terminal(PROMPT)?;
+                    write_terminal(b"\x1b[?2004h")?;
                 }
                 Action::TooLong => {
-                    write_terminal(b"\nsh: command line is too long\n")?;
-                    write_terminal(PROMPT)?;
+                    source.clear();
+                    renderer.reset();
+                    shell.state.status = 2;
+                    write_terminal(b"\nsh: command line is too long\nhyper-sh$ ")?;
                 }
                 Action::Cancel => {
-                    write_terminal(b"^C\n")?;
-                    write_terminal(PROMPT)?;
+                    source.clear();
+                    renderer.reset();
+                    shell.state.status = 130;
+                    write_terminal(b"^C\nhyper-sh$ ")?;
                 }
-                Action::Exit => return Ok(ExitCode::SUCCESS),
+                Action::Exit if !source.is_empty() => {
+                    source.clear();
+                    write_terminal(b"\nsh: incomplete command\nhyper-sh$ ")?;
+                }
+                Action::Exit => {
+                    write_terminal(b"\x1b[?2004l\n")?;
+                    return Ok(exit_code(shell.state.status));
+                }
             }
         }
     }
-}
-
-fn execute_line(
-    bytes: &[u8],
-    authorities: &mut CommandAuthorities,
-    input: &Inherited,
-) -> Result<CommandFlow, Error> {
-    let pipeline = match Pipeline::parse(bytes) {
-        Ok(command) => command,
-        Err(_) => {
-            write_terminal(b"sh: invalid command syntax\n")?;
-            return Ok(CommandFlow::Continue);
-        }
-    };
-    let Some(stage) = pipeline.0.first() else {
-        return Ok(CommandFlow::Continue);
-    };
-    let command = &stage.command;
-    let Some(name) = command.argument(0) else {
-        write_terminal(b"sh: command is not valid UTF-8\n")?;
-        return Ok(CommandFlow::Continue);
-    };
-    if pipeline.0.len() > 1
-        || !stage.redirects.is_empty()
-        || !matches!(name, "cd" | "pwd" | "clear" | "exit" | "help")
-    {
-        launch_pipeline(&pipeline, bytes, authorities, input)?;
-        return Ok(CommandFlow::Continue);
-    }
-    let builtin = match Builtin::try_parse_from(std::iter::once("sh").chain(command.arguments())) {
-        Ok(args) => args.command,
-        Err(error) => {
-            write_terminal(error.to_string().as_bytes())?;
-            return Ok(CommandFlow::Continue);
-        }
-    };
-    match builtin {
-        BuiltinCommand::Help => {
-            writeln!(std::io::stdout(), "builtins: cd clear exit help pwd\napps: cat grep echo ls ps free top handle vmm\nPipelines: A | B; files: < > >> 2> 2>>\nHistory: Up/Down; Ctrl-U clears the line; Ctrl-L redraws.\nUse APP --help for options (echo: -n, -e, -E).")
-                .map_err(Error::Io)?
-        }
-        BuiltinCommand::Cd(args) => builtin_cd(&args.directory, authorities)?,
-        BuiltinCommand::Pwd => writeln!(
-            std::io::stdout(),
-            "{}",
-            authorities
-                .current_path
-                .as_str()
-                .map_err(|_| Error::InvalidCommand)?
-        )
-        .map_err(Error::Io)?,
-        BuiltinCommand::Clear => std::io::stdout()
-            .write_all(b"\x1b[2J\x1b[H")
-            .map_err(Error::Io)?,
-        BuiltinCommand::Exit => return Ok(CommandFlow::Exit),
-    }
-    Ok(CommandFlow::Continue)
-}
-
-fn builtin_cd(target: &str, authorities: &mut CommandAuthorities) -> Result<(), Error> {
-    let path = match authorities.current_path.resolve(target) {
-        Ok(path) => path,
-        Err(_) => {
-            write_terminal(b"cd: invalid directory path\n")?;
-            return Ok(());
-        }
-    };
-    let path_text = path.as_str().map_err(|_| Error::InvalidCommand)?;
-    let directory = if path_text == "/" {
-        authorities
-            .root_directory
-            .scope_at(&authorities.root_directory, WORKING_DIRECTORY_RIGHTS)
-    } else {
-        authorities
-            .root_directory
-            .open_directory(path_text, WORKING_DIRECTORY_RIGHTS)
-    };
-    let directory = match directory {
-        Ok(directory) => directory,
-        Err(_) => {
-            write_terminal(b"cd: cannot open directory\n")?;
-            return Ok(());
-        }
-    };
-    authorities.current_directory = directory;
-    authorities.current_path = path;
-    Ok(())
 }
 
 fn write_terminal(bytes: &[u8]) -> Result<(), Error> {
@@ -282,17 +433,13 @@ struct CommandAuthorities {
     terminal: Option<hyper_terminal::Terminal>,
 }
 
-enum CommandFlow {
-    Continue,
-    Exit,
-}
-
 #[derive(Debug)]
 enum Error {
     OperatingSystem(OsError),
     Io(std::io::Error),
     InvalidCommand,
     Protocol,
+    Message(String),
 }
 
 impl std::fmt::Display for Error {
@@ -302,6 +449,7 @@ impl std::fmt::Display for Error {
             Self::Io(error) => write!(formatter, "I/O failed: {error}"),
             Self::InvalidCommand => formatter.write_str("command launch failed"),
             Self::Protocol => formatter.write_str("protocol violation"),
+            Self::Message(message) => formatter.write_str(message),
         }
     }
 }
@@ -314,32 +462,14 @@ impl From<OsError> for Error {
 
 fn main() -> ExitCode {
     let args = hyper_shell::cli::Shell::parse();
-    if let Some(words) = args.builtin {
-        let args = match Builtin::try_parse_from(std::iter::once("sh".to_owned()).chain(words)) {
-            Ok(args) => args,
-            Err(error) => {
-                let _ = error.print();
-                return ExitCode::FAILURE;
-            }
-        };
-        let result = match args.command {
-            BuiltinCommand::Pwd => std::env::current_dir()
-                .and_then(|path| writeln!(std::io::stdout(), "{}", path.display())),
-            BuiltinCommand::Clear => std::io::stdout().write_all(b"\x1b[2J\x1b[H"),
-            BuiltinCommand::Help => writeln!(
-                std::io::stdout(),
-                "builtins: cd clear exit help pwd\nPipelines: A | B; files: < > >> 2> 2>>"
-            ),
-            _ => return ExitCode::FAILURE,
-        };
-        return if result.is_ok() {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::FAILURE
-        };
-    }
-    match hyper_rt::process::startup() {
-        Ok(startup) => application_main(startup),
-        Err(_) => ExitCode::FAILURE,
+    match hyper_rt::process::startup()
+        .map_err(Error::from)
+        .and_then(|mut startup| run(&mut startup, &args))
+    {
+        Ok(code) => code,
+        Err(error) => {
+            let _ = writeln!(std::io::stderr(), "sh: {error}");
+            ExitCode::from(2)
+        }
     }
 }

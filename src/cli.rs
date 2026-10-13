@@ -1,36 +1,24 @@
 // SPDX-FileCopyrightText: 2026 roolrz
 // SPDX-License-Identifier: Apache-2.0
 
-use clap::{Args, Parser, Subcommand};
+use clap::Parser;
 
 #[derive(Debug, Parser)]
-#[command(about = "Native capability-scoped command shell")]
+#[command(about = "Native system shell", trailing_var_arg = true)]
 pub struct Shell {
-    /// Execute an output-only builtin in a pipeline child.
-    #[arg(long, hide = true, num_args = 1.., allow_hyphen_values = true)]
-    pub builtin: Option<Vec<String>>,
-}
-
-#[derive(Debug, Parser)]
-#[command(disable_help_subcommand = true)]
-pub struct Builtin {
-    #[command(subcommand)]
-    pub command: BuiltinCommand,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum BuiltinCommand {
-    Cd(Cd),
-    Pwd,
-    Clear,
-    Exit,
-    Help,
-}
-
-#[derive(Debug, Args)]
-pub struct Cd {
-    #[arg(default_value = "/")]
-    pub directory: String,
+    /// Execute a command string; following words supply $0, $1, ... .
+    #[arg(short = 'c', allow_hyphen_values = true)]
+    pub command: Option<String>,
+    /// Read commands interactively.
+    #[arg(short = 'i')]
+    pub interactive: bool,
+    /// Parse a script without executing it.
+    #[arg(short = 'n')]
+    pub check: bool,
+    #[arg(long, hide = true)]
+    pub worker: bool,
+    /// Script path and positional arguments (or command-string arguments).
+    pub arguments: Vec<String>,
 }
 
 #[cfg(test)]

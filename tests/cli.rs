@@ -4,11 +4,12 @@
 use super::*;
 
 #[test]
-fn builtin_errors_and_help_return_to_shell() {
-    assert!(Builtin::try_parse_from(["sh", "cd"]).is_ok());
-    assert!(Builtin::try_parse_from(["sh", "pwd", "extra"]).is_err());
-    assert!(
-        Builtin::try_parse_from(["sh", "cd", "--help"])
-            .is_err_and(|e| e.kind() == clap::error::ErrorKind::DisplayHelp)
-    );
+fn command_script_and_positional_arguments() -> Result<(), clap::Error> {
+    let args = Shell::try_parse_from(["sh", "-c", "echo $1", "command", "-x"])?;
+    assert_eq!(args.command.as_deref(), Some("echo $1"));
+    assert_eq!(args.arguments, ["command", "-x"]);
+    let args = Shell::try_parse_from(["sh", "-n", "script.sh", "--arg"])?;
+    assert!(args.check);
+    assert_eq!(args.arguments, ["script.sh", "--arg"]);
+    Ok(())
 }
