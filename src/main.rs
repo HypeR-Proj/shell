@@ -10,7 +10,6 @@ extern crate hyper_clap_shared as _;
 mod capabilities;
 mod descriptor;
 mod input;
-mod interactive;
 mod launch;
 mod reactor;
 mod route;
@@ -28,6 +27,7 @@ use hyper_os::startup::{self, Startup};
 use hyper_service::stdio::{Inherited, StandardStream};
 use hyper_service::{filesystem, process, vm};
 use hyper_shell::editor::{Action, Editor};
+use hyper_shell::interactive;
 use hyper_shell::path::CanonicalPath;
 use std::io::{Read, Write};
 use std::process::ExitCode;
@@ -308,12 +308,15 @@ fn interactive_shell(shell: &mut Shell<launch::NativeBackend>) -> Result<ExitCod
                     write_terminal(&[byte])?;
                     renderer.track(&editor, prompt);
                 }
+                Action::Backspace(removed) => {
+                    write_terminal(renderer.backspace(&editor, prompt, removed).as_bytes())?;
+                }
                 Action::Redraw | Action::ClearScreen => {
                     if byte == 12 {
                         write_terminal(b"\x1b[2J\x1b[H")?;
                         renderer.reset();
                     }
-                    renderer.draw(&editor, prompt)?;
+                    write_terminal(renderer.draw(&editor, prompt).as_bytes())?;
                 }
                 Action::Complete => {
                     let line = std::str::from_utf8(editor.line()).unwrap_or("");
@@ -331,7 +334,7 @@ fn interactive_shell(shell: &mut Shell<launch::NativeBackend>) -> Result<ExitCod
                             renderer.reset();
                         }
                         editor.replace(completion.start, &completion.replacement);
-                        renderer.draw(&editor, prompt)?;
+                        write_terminal(renderer.draw(&editor, prompt).as_bytes())?;
                     } else {
                         write_terminal(b"\x07")?;
                     }

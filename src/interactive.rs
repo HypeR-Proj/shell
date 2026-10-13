@@ -3,9 +3,9 @@
 
 //! Terminal rendering is separate from input editing and shell evaluation.
 
-use crate::{Error, write_terminal};
-use hyper_shell::editor::Editor;
-use hyper_shell::layout::Position;
+use crate::editor::Editor;
+use crate::layout::Position;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub fn display(text: &str) -> String {
     let mut out = String::new();
@@ -55,7 +55,66 @@ impl Renderer {
             self.position.append(character, self.columns);
         }
     }
-    pub fn draw(&mut self, editor: &Editor, prompt: &str) -> Result<(), Error> {
+    /// Repaint only the suffix affected by deleting the previous scalar.
+    /// Combining/format characters can change the preceding glyph, so those
+    /// edits retain the complete redraw until editing is grapheme-aware.
+    pub fn backspace(&mut self, editor: &Editor, prompt: &str, removed: char) -> String {
+        let Ok(line) = std::str::from_utf8(editor.line()) else {
+            return self.draw(editor, prompt);
+        };
+        let (prefix, suffix) = line.split_at(editor.cursor());
+        // Regional indicators form flag glyphs even when their combined width
+        // happens to equal the sum of the individual scalar widths.
+        let requires_context =
+            |c: char| c.width().unwrap_or(0) == 0 || ('\u{1f1e6}'..='\u{1f1ff}').contains(&c);
+        if removed.is_control()
+            || requires_context(removed)
+            || prefix.chars().next_back().is_some_and(requires_context)
+            || suffix.chars().next().is_some_and(requires_context)
+            || !scalar_width_matches(line)
+            || !scalar_width_matches(&format!("{prefix}{removed}{suffix}"))
+        {
+            return self.draw(editor, prompt);
+        }
+        let mut cursor = Position::default();
+        cursor.append(prompt, self.columns);
+        cursor.append(&display(prefix), self.columns);
+        cursor.materialize_wrap(self.columns);
+        let output = if suffix.is_empty()
+            && self.position.row == cursor.row
+            && self.position.column < self.columns
+            && self.position.column > cursor.column
+        {
+            let cells = self.position.column - cursor.column;
+            format!(
+                "{}{}{}",
+                "\x08".repeat(cells),
+                " ".repeat(cells),
+                "\x08".repeat(cells)
+            )
+        } else {
+            // Absolute column positioning also cancels the terminal's pending
+            // wrap at the right margin. Clear from the edit point through any
+            // old wrapped rows, leaving the prompt and prefix untouched.
+            let mut output = cursor_move(self.position, cursor);
+            output.push_str("\x1b[J");
+            let suffix = display(suffix);
+            output.push_str(&suffix);
+            let mut end = cursor;
+            end.append(&suffix, self.columns);
+            if end.materialize_wrap(self.columns) {
+                output.push_str("\r\n");
+            }
+            if !suffix.is_empty() {
+                output.push_str(&cursor_move(end, cursor));
+            }
+            output
+        };
+        self.position = cursor;
+        output
+    }
+
+    pub fn draw(&mut self, editor: &Editor, prompt: &str) -> String {
         let prompt = if let Some(query) = editor.search() {
             format!(
                 "(reverse-search: {}) ",
@@ -66,27 +125,46 @@ impl Renderer {
         };
         let line = display(&String::from_utf8_lossy(editor.line()));
         let prefix = display(&String::from_utf8_lossy(&editor.line()[..editor.cursor()]));
-        write_terminal(b"\r")?;
+        let mut output = String::from("\r");
         if self.position.row != 0 {
-            write_terminal(format!("\x1b[{}A", self.position.row).as_bytes())?;
+            output.push_str(&format!("\x1b[{}A", self.position.row));
         }
-        write_terminal(b"\x1b[J")?;
-        write_terminal(prompt.as_bytes())?;
-        write_terminal(line.as_bytes())?;
+        output.push_str("\x1b[J");
+        output.push_str(&prompt);
+        output.push_str(&line);
         let mut end = Position::default();
         end.append(&prompt, self.columns);
         end.append(&line, self.columns);
         if end.materialize_wrap(self.columns) {
-            write_terminal(b"\r\n")?;
+            output.push_str("\r\n");
         }
         let mut cursor = Position::default();
         cursor.append(&prompt, self.columns);
         cursor.append(&prefix, self.columns);
         cursor.materialize_wrap(self.columns);
         self.position = cursor;
-        if end.row > cursor.row {
-            write_terminal(format!("\x1b[{}A", end.row - cursor.row).as_bytes())?;
-        }
-        write_terminal(format!("\x1b[{}G", cursor.column + 1).as_bytes())
+        output.push_str(&cursor_move(end, cursor));
+        output
     }
 }
+
+fn cursor_move(from: Position, to: Position) -> String {
+    let mut output = String::new();
+    if from.row > to.row {
+        output.push_str(&format!("\x1b[{}A", from.row - to.row));
+    } else if from.row < to.row {
+        output.push_str(&format!("\x1b[{}B", to.row - from.row));
+    }
+    output.push_str(&format!("\x1b[{}G", to.column + 1));
+    output
+}
+
+fn scalar_width_matches(text: &str) -> bool {
+    // Flags, emoji modifiers and ligatures need more than per-scalar cell
+    // arithmetic. Avoid erasing neighboring glyphs with the local fast path.
+    text.width() == text.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>()
+}
+
+#[cfg(test)]
+#[path = "../tests/interactive.rs"]
+mod tests;

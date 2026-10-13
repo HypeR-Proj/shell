@@ -11,6 +11,7 @@ const HISTORY_LINES: usize = crate::history::MAX_ENTRIES;
 pub enum Action {
     None,
     Echo(u8),
+    Backspace(char),
     Redraw,
     ClearScreen,
     Complete,
@@ -211,9 +212,12 @@ impl Editor {
                     return Action::None;
                 }
                 let start = previous(&self.line, self.cursor);
+                let removed = std::str::from_utf8(&self.line[start..self.cursor])
+                    .ok()
+                    .and_then(|text| text.chars().next());
                 self.line.drain(start..self.cursor);
                 self.cursor = start;
-                Action::Redraw
+                removed.map_or(Action::Redraw, Action::Backspace)
             }
             b' '..=b'~' | 0x80..=0xff => self.insert(byte),
             _ => Action::None,

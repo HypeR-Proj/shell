@@ -5,6 +5,7 @@ pub mod cli;
 pub mod completion;
 pub mod editor;
 pub mod history;
+pub mod interactive;
 pub mod interpreter;
 pub mod layout;
 pub mod path;
