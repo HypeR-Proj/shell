@@ -15,7 +15,7 @@ use hyper_os::wait::{ObjectSignals, WaitItem, wait_many};
 use hyper_os::{Error as OsError, Status};
 use hyper_service::stdio::{Inherited, StandardStream};
 use hyper_service::{filesystem, process, stdio, vm};
-use hyper_shell::program::{Authority, ImageSource, Program, RuntimeEnvironment};
+use hyper_shell::program::{Authority, Program};
 
 pub(super) fn prepare_command(
     arguments: &[String],
@@ -26,11 +26,7 @@ pub(super) fn prepare_command(
     let name = arguments.first().ok_or(Error::InvalidCommand)?;
     let program =
         Program::resolve(name, &authorities.current_path).map_err(|_| Error::InvalidCommand)?;
-    let image_directory = match program.source {
-        ImageSource::Environment => &authorities.environment,
-        ImageSource::Namespace => &authorities.root_directory,
-    };
-    let executable = match image_directory.open(
+    let executable = match authorities.root_directory.open(
         &program.path,
         hyper_service::process::EXECUTABLE_FILE_RIGHTS,
     ) {
@@ -44,28 +40,9 @@ pub(super) fn prepare_command(
             return Err(Error::Message(format!("{name}: {reason}: {open_error:?}")));
         }
     };
-    // Commands outside the recovery tree use the full loader even for static ELF.
-    // Keep recovery independent of the mounted system and its loader.
-    // Resolve /system only when starting a system command. A directory opened
-    // before storage mounts would keep naming the covered RAM directory.
-    let system_environment = match program.environment {
-        RuntimeEnvironment::Recovery => None,
-        RuntimeEnvironment::System => Some(
-            process::open_environment(&authorities.root_directory, "/system")
-                .map_err(Error::from)?,
-        ),
-    };
-    let system_libraries = system_environment
-        .as_ref()
-        .map(process::open_library_directory)
-        .transpose()
-        .map_err(Error::from)?;
-    let command_loader = system_environment
-        .as_ref()
-        .map(|environment| process::open_loader(environment, process::LoaderKind::Dynamic))
-        .transpose()
-        .map_err(Error::from)?;
-    let loader = command_loader.as_ref().unwrap_or(&authorities.loader);
+    // The session delegates one formal loader and library directory. The
+    // dynamic loader also handles static ELF, so no boot archive is retained.
+    let loader = &authorities.loader;
     let builder = ProcessBuilder::create(
         authorities.factory.as_handle_ref(),
         authorities.group.as_handle_ref(),
@@ -109,10 +86,7 @@ pub(super) fn prepare_command(
     }
     builder
         .add_handle_duplicate(
-            system_libraries
-                .as_ref()
-                .unwrap_or(&authorities.library_directory)
-                .as_handle_ref(),
+            authorities.library_directory.as_handle_ref(),
             startup::DYNAMIC_LIBRARY_DIRECTORY.as_raw(),
             RightsOffer::Exact(
                 Rights::READ

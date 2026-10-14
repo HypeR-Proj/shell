@@ -46,7 +46,7 @@ impl Default for State {
             last_duration_ns: 0,
         };
         for (name, value) in [
-            ("PATH", "/system/bin:/boot/bin"),
+            ("PATH", "/bin"),
             ("IFS", " \t\n"),
             ("PWD", "/"),
             ("HOME", "/"),

@@ -4,16 +4,14 @@
 use super::*;
 
 #[test]
-fn recovery_commands_use_the_retained_environment_from_any_cwd() -> Result<(), Error> {
+fn mount_commands_use_the_system_environment_from_any_cwd() -> Result<(), Error> {
     for cwd in [
         CanonicalPath::root(),
         CanonicalPath::root().resolve("/data")?,
     ] {
         for name in ["mount", "umount"] {
             let program = Program::resolve(name, &cwd)?;
-            assert_eq!(program.path, format!("bin/{name}"));
-            assert_eq!(program.source, ImageSource::Environment);
-            assert_eq!(program.environment, RuntimeEnvironment::Recovery);
+            assert_eq!(program.path, format!("/bin/{name}"));
             assert!(!program.is_shell());
         }
     }
@@ -24,9 +22,7 @@ fn recovery_commands_use_the_retained_environment_from_any_cwd() -> Result<(), E
 fn ordinary_commands_have_one_system_location() -> Result<(), Error> {
     for name in ["sh", "ls", "ps", "vmm", "not-installed"] {
         let program = Program::resolve(name, &CanonicalPath::root())?;
-        assert_eq!(program.path, format!("/system/bin/{name}"));
-        assert_eq!(program.source, ImageSource::Namespace);
-        assert_eq!(program.environment, RuntimeEnvironment::System);
+        assert_eq!(program.path, format!("/bin/{name}"));
     }
     Ok(())
 }
@@ -37,12 +33,11 @@ fn explicit_paths_are_not_rewritten_into_a_different_environment() -> Result<(),
     for (input, expected) in [
         ("./mount", "/data/tools/mount"),
         ("../vmm", "/data/vmm"),
-        ("/bin/ps", "/bin/ps"),
+        ("/system/bin/ps", "/system/bin/ps"),
         ("/boot/bin/sh", "/boot/bin/sh"),
     ] {
         let program = Program::resolve(input, &cwd)?;
         assert_eq!(program.path, expected);
-        assert_eq!(program.source, ImageSource::Namespace);
         assert_eq!(program.authority, None);
     }
     Ok(())
@@ -65,12 +60,9 @@ fn private_authorities_follow_selected_trusted_paths_not_basenames() -> Result<(
             None
         );
     }
+    assert_eq!(Program::resolve("/boot/bin/mount", &cwd)?.authority, None);
     assert_eq!(
-        Program::resolve("/boot/bin/mount", &cwd)?.authority,
-        Some(Authority::Filesystem)
-    );
-    assert_eq!(
-        Program::resolve("/system/bin/vmm", &cwd)?.authority,
+        Program::resolve("/bin/vmm", &cwd)?.authority,
         Some(Authority::VirtualMachines)
     );
     Ok(())
@@ -79,7 +71,7 @@ fn private_authorities_follow_selected_trusted_paths_not_basenames() -> Result<(
 #[test]
 fn fallback_service_is_not_found_by_bare_name() -> Result<(), Error> {
     let program = Program::resolve("fallback-sh", &CanonicalPath::root())?;
-    assert_eq!(program.path, "/system/bin/fallback-sh");
+    assert_eq!(program.path, "/bin/fallback-sh");
     assert!(!program.is_shell());
     assert!(Program::resolve("sh", &CanonicalPath::root())?.is_shell());
     Ok(())
@@ -88,15 +80,10 @@ fn fallback_service_is_not_found_by_bare_name() -> Result<(), Error> {
 #[test]
 fn shell_delegation_is_limited_to_the_trusted_system_image() -> Result<(), Error> {
     let cwd = CanonicalPath::root().resolve("/data")?;
-    for name in ["sh", "/system/bin/sh", "../system/bin/sh"] {
+    for name in ["sh", "/bin/sh", "../bin/sh"] {
         assert!(Program::resolve(name, &cwd)?.is_shell());
     }
-    for name in [
-        "./sh",
-        "/data/sh",
-        "/boot/svc/fallback-sh",
-        "/system/bin/sh-copy",
-    ] {
+    for name in ["./sh", "/data/sh", "/boot/svc/fallback-sh", "/bin/sh-copy"] {
         assert!(!Program::resolve(name, &cwd)?.is_shell());
     }
     Ok(())

@@ -190,7 +190,7 @@ impl NativeBackend {
                         return Err(Error::Message("shell worker state limit exceeded".into()));
                     }
                     (
-                        vec!["/system/bin/sh".into(), "--worker".into()],
+                        vec!["/bin/sh".into(), "--worker".into()],
                         worker.state.environment(),
                         Some(bytes),
                     )
