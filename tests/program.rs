@@ -51,6 +51,7 @@ fn private_authorities_follow_selected_trusted_paths_not_basenames() -> Result<(
         ("ps", Authority::Tasks),
         ("handle", Authority::Handles),
         ("free", Authority::Memory),
+        ("memstat", Authority::Memory),
         ("top", Authority::Activity),
         ("vmm", Authority::VirtualMachines),
     ] {

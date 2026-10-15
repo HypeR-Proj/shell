@@ -39,7 +39,7 @@ impl Program {
             "/bin/mount" | "/bin/umount" => Some(Authority::Filesystem),
             "/bin/ps" => Some(Authority::Tasks),
             "/bin/handle" => Some(Authority::Handles),
-            "/bin/free" => Some(Authority::Memory),
+            "/bin/free" | "/bin/memstat" => Some(Authority::Memory),
             "/bin/top" => Some(Authority::Activity),
             "/bin/vmm" => Some(Authority::VirtualMachines),
             _ => None,
