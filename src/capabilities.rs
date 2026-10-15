@@ -60,6 +60,15 @@ pub(super) fn prepare_command(
             objects: authorities.object_inspector.as_handle_ref(),
             memory: authorities.memory_inspector.as_handle_ref(),
             cpus: authorities.cpu_inspector.as_handle_ref(),
+            services: authorities
+                .services
+                .as_ref()
+                .map(OwnedHandle::as_handle_ref),
+            service_control: authorities
+                .service_control
+                .as_ref()
+                .map(OwnedHandle::as_handle_ref),
+            journal: authorities.journal.as_ref().map(OwnedHandle::as_handle_ref),
             filesystem: authorities
                 .filesystem_control
                 .as_ref()
@@ -164,6 +173,29 @@ pub(super) fn prepare_command(
     }
     child.output.add_to(&builder, StandardStream::Output)?;
     match program.authority {
+        Some(Authority::Services) => {
+            for (handle, purpose) in [
+                (&authorities.services, hyper_component::OBSERVE),
+                (&authorities.service_control, hyper_component::CONTROL),
+            ] {
+                if let Some(handle) = handle {
+                    builder.add_handle_duplicate(
+                        handle.as_handle_ref(),
+                        purpose.as_raw(),
+                        RightsOffer::Exact(hyper_service_ipc::CLIENT_RIGHTS),
+                    )?;
+                }
+            }
+        }
+        Some(Authority::Journal) => {
+            if let Some(handle) = &authorities.journal {
+                builder.add_handle_duplicate(
+                    handle.as_handle_ref(),
+                    hyper_journal::QUERY.as_raw(),
+                    RightsOffer::Exact(hyper_service_ipc::CLIENT_RIGHTS),
+                )?;
+            }
+        }
         Some(Authority::Filesystem) => {
             if let Some(control) = authorities.filesystem_control.as_ref() {
                 builder

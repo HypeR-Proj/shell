@@ -88,7 +88,13 @@ fn run(startup: &mut Startup<'_>, args: &hyper_shell::cli::Shell) -> Result<Exit
     let filesystem_control = startup
         .take_optional(filesystem::CONTROL_CLIENT)
         .map_err(Error::from)?;
+    let services = startup.take_optional(hyper_component::OBSERVE)?;
+    let service_control = startup.take_optional(hyper_component::CONTROL)?;
+    let journal = startup.take_optional(hyper_journal::QUERY)?;
     let authorities = CommandAuthorities {
+        services,
+        service_control,
+        journal,
         root_directory,
         environment,
         current_directory,
@@ -418,6 +424,9 @@ fn write_terminal(bytes: &[u8]) -> Result<(), Error> {
 }
 
 struct CommandAuthorities {
+    services: Option<OwnedHandle<hyper_os::handle::CapabilityChannelObject>>,
+    service_control: Option<OwnedHandle<hyper_os::handle::CapabilityChannelObject>>,
+    journal: Option<OwnedHandle<hyper_os::handle::CapabilityChannelObject>>,
     root_directory: Directory,
     environment: Directory,
     current_directory: Directory,

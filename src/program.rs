@@ -7,6 +7,8 @@ use crate::path::{CanonicalPath, Error};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Authority {
+    Services,
+    Journal,
     Filesystem,
     Tasks,
     Handles,
@@ -36,6 +38,8 @@ impl Program {
         };
         // Authority follows the selected trusted program, never its basename.
         let authority = match path.as_str() {
+            "/bin/componentctl" => Some(Authority::Services),
+            "/bin/journalctl" => Some(Authority::Journal),
             "/bin/mount" | "/bin/umount" => Some(Authority::Filesystem),
             "/bin/ps" => Some(Authority::Tasks),
             "/bin/handle" => Some(Authority::Handles),
