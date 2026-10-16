@@ -32,6 +32,7 @@ pub(super) struct NativeBackend {
     pub input: Inherited,
     pub output: Inherited,
     pub error: Inherited,
+    pub terminal_stdio: [bool; 3],
     pub read_settings: Option<hyper_terminal::Settings>,
 }
 
@@ -99,20 +100,20 @@ impl NativeBackend {
         for _ in 1..stages.len() {
             pipes.push(channel::create_pair()?);
         }
-        let mut lease_owner = None;
+        // One foreground lease belongs to the whole pipeline. Its final
+        // consumer alone receives control, and remains the owner after an
+        // upstream producer exits (cat FILE | less). Ordinary stream writers
+        // do not need terminal-control authority.
+        let lease_owner = stages.len().checked_sub(1);
+        let mut client = if !stages.is_empty() && self.authorities.terminal.is_some() {
+            let terminal = self.authorities.terminal.as_mut().ok_or(Error::Protocol)?;
+            let client = terminal.prepare_child()?;
+            *lease = Some(client.id);
+            Some(client)
+        } else {
+            None
+        };
         for (index, stage) in stages.into_iter().enumerate() {
-            let client = if matches!(stage.streams.get(0), Port::Standard(0))
-                && self.authorities.terminal.is_some()
-                && lease.is_none()
-            {
-                let terminal = self.authorities.terminal.as_mut().ok_or(Error::Protocol)?;
-                let client = terminal.prepare_child()?;
-                *lease = Some(client.id);
-                lease_owner = Some(index);
-                Some(client)
-            } else {
-                None
-            };
             let terminal_stream = client.as_ref().map(|c| &c.stream);
             let child_input = self.endpoint(
                 stage.streams.get(0),
@@ -142,7 +143,11 @@ impl NativeBackend {
                     &mut adapters,
                 )?
             };
-            let terminal = client.map(|c| (c.control, c.events));
+            let terminal = if lease_owner == Some(index) {
+                client.take()
+            } else {
+                None
+            };
             let mut descriptor_child = None;
             let (arguments, environment, payload) = match stage.invocation {
                 Invocation::External {
@@ -279,7 +284,7 @@ impl NativeBackend {
                 Ok(Inherited::Pipe(handle.duplicate(rights)?))
             }
             Port::Standard(0) if fd == 0 => {
-                if let Some(terminal) = terminal {
+                if let Some(terminal) = terminal.filter(|_| self.terminal_stdio[0]) {
                     Ok(Inherited::Stream(
                         terminal.duplicate(hyper_os::stream::CONNECTOR_RIGHTS)?,
                     ))
@@ -287,11 +292,18 @@ impl NativeBackend {
                     Ok(self.input.duplicate(StandardStream::Input)?)
                 }
             }
-            Port::Standard(1 | 2) if terminal.is_some() => Ok(Inherited::Stream(
-                terminal
-                    .ok_or(Error::Protocol)?
-                    .duplicate(hyper_os::stream::CONNECTOR_RIGHTS)?,
-            )),
+            // A shell worker may inherit a pipe or redirected file under a
+            // standard descriptor. Only replace actual terminal endpoints;
+            // control ownership does not change data-stream routing.
+            Port::Standard(source @ (1 | 2))
+                if terminal.is_some() && self.terminal_stdio[usize::from(source)] =>
+            {
+                Ok(Inherited::Stream(
+                    terminal
+                        .ok_or(Error::Protocol)?
+                        .duplicate(hyper_os::stream::CONNECTOR_RIGHTS)?,
+                ))
+            }
             // Unredirected output keeps its original transport. Relaying stdout
             // and stderr independently at every nested shell lets a later
             // stdout prompt overtake already-written stderr fragments.

@@ -155,19 +155,26 @@ pub(super) fn prepare_command(
         )
         .map_err(|_| Error::InvalidCommand)?;
     child.input.add_to(&builder, StandardStream::Input)?;
-    if let Some((control, events)) = child.terminal {
+    if let Some(terminal) = child.terminal {
         builder
             .add_handle_move(
-                control,
+                terminal.control,
                 hyper_terminal::client::CONTROL.as_raw(),
                 RightsOffer::Exact(hyper_terminal::client::CONTROL_RIGHTS),
             )
             .map_err(|failure| failure.error())?;
         builder
             .add_handle_move(
-                events,
+                terminal.events,
                 hyper_terminal::client::EVENTS.as_raw(),
                 RightsOffer::Exact(hyper_terminal::client::EVENT_RIGHTS),
+            )
+            .map_err(|failure| failure.error())?;
+        builder
+            .add_handle_move(
+                terminal.stream,
+                hyper_terminal::client::STREAM.as_raw(),
+                RightsOffer::Exact(hyper_os::stream::CONNECTOR_RIGHTS),
             )
             .map_err(|failure| failure.error())?;
     }
@@ -356,10 +363,7 @@ fn add_child_channel(
 
 pub(super) struct ChildChannels {
     pub input: Inherited,
-    pub terminal: Option<(
-        OwnedHandle<CapabilityChannelObject>,
-        OwnedHandle<ByteChannelObject>,
-    )>,
+    pub terminal: Option<hyper_terminal::PreparedClient>,
     pub output: Inherited,
     pub error: Inherited,
 }

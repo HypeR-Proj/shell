@@ -29,7 +29,7 @@ use hyper_service::{filesystem, process, vm};
 use hyper_shell::editor::{Action, Editor};
 use hyper_shell::interactive;
 use hyper_shell::path::CanonicalPath;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 
 const INPUT_CHUNK_BYTES: usize = 1;
@@ -137,6 +137,11 @@ fn run(startup: &mut Startup<'_>, args: &hyper_shell::cli::Shell) -> Result<Exit
             input,
             output,
             error,
+            terminal_stdio: [
+                std::io::stdin().is_terminal(),
+                std::io::stdout().is_terminal(),
+                std::io::stderr().is_terminal(),
+            ],
             read_settings: None,
         },
     );
@@ -194,6 +199,7 @@ fn run(startup: &mut Startup<'_>, args: &hyper_shell::cli::Shell) -> Result<Exit
     let interactive = args.interactive
         || args.command.is_none()
             && args.arguments.is_empty()
+            && shell.backend.terminal_stdio[0]
             && shell.backend.authorities.terminal.is_some();
     if let Some(command) = &args.command {
         if let Some(name) = args.arguments.first() {
