@@ -67,7 +67,7 @@ fn tail_backspace_erases_cells_without_reprinting_prompt_or_prefix() {
 fn middle_backspace_repaints_only_the_shifted_suffix() {
     let mut terminal = Terminal::new("hyper-sh$ ", 80);
     terminal.input(b"abcdef\x1b[D\x1b[D\x1b[D");
-    assert_eq!(terminal.input(&[127]), b"\x1b[13G\x1b[Jdef\x1b[13G");
+    assert_eq!(terminal.input(&[127]), b"\r\x1b[12C\x1b[Jdef\r\x1b[12C");
     assert_eq!(terminal.editor.line(), b"abdef");
     assert_eq!(terminal.position(), (0, 12));
     terminal.input(b"\x01");
@@ -79,13 +79,13 @@ fn erase_at_pending_right_margin_cancels_wrap_before_clearing() {
     let mut terminal = Terminal::new("> ", 8);
     terminal.input(b"abcdef");
     assert_eq!(terminal.position(), (0, 8));
-    assert_eq!(terminal.input(&[127]), b"\x1b[8G\x1b[J");
+    assert_eq!(terminal.input(&[127]), b"\r\x1b[7C\x1b[J");
     assert_eq!(terminal.position(), (0, 7));
     terminal.input(b"XY");
     assert_eq!(terminal.position(), (1, 1));
     assert_eq!(terminal.input(&[127]), b"\x08 \x08");
     assert_eq!(terminal.position(), (1, 0));
-    assert_eq!(terminal.input(&[127]), b"\x1b[1A\x1b[8G\x1b[J");
+    assert_eq!(terminal.input(&[127]), b"\x1b[1A\r\x1b[7C\x1b[J");
     assert_eq!(terminal.position(), (0, 7));
 }
 
@@ -94,7 +94,7 @@ fn wide_character_wrap_erases_the_old_row_without_reprinting_prefix() {
     let mut terminal = Terminal::new("> ", 8);
     terminal.input("abcde界".as_bytes());
     assert_eq!(terminal.position(), (1, 2));
-    assert_eq!(terminal.input(&[127]), b"\x1b[1A\x1b[8G\x1b[J");
+    assert_eq!(terminal.input(&[127]), b"\x1b[1A\r\x1b[7C\x1b[J");
     assert_eq!(terminal.editor.line(), b"abcde");
     assert_eq!(terminal.position(), (0, 7));
 }
@@ -106,7 +106,7 @@ fn middle_erase_can_pull_suffix_back_across_a_wrap() {
     assert_eq!(terminal.position(), (1, 0));
     assert_eq!(
         terminal.input(&[127]),
-        b"\x1b[1A\x1b[8G\x1b[Jyz\x1b[1A\x1b[8G"
+        b"\x1b[1A\r\x1b[7C\x1b[Jyz\x1b[1A\r\x1b[7C"
     );
     assert_eq!(terminal.editor.line(), b"abcdeyz");
     assert_eq!(terminal.position(), (0, 7));
@@ -116,10 +116,10 @@ fn middle_erase_can_pull_suffix_back_across_a_wrap() {
 fn combining_or_incomplete_utf8_retains_safe_redraw() {
     let mut terminal = Terminal::new("> ", 80);
     terminal.input("e\u{301}".as_bytes());
-    assert_eq!(terminal.input(&[127]), b"\r\x1b[J> e\x1b[4G");
+    assert_eq!(terminal.input(&[127]), b"\r\x1b[J> e\r\x1b[3C");
     assert_eq!(terminal.position(), (0, 3));
     terminal.input(&[0xe4]);
-    assert_eq!(terminal.input(&[127]), b"\r\x1b[J> e\x1b[4G");
+    assert_eq!(terminal.input(&[127]), b"\r\x1b[J> e\r\x1b[3C");
     terminal.input("a\u{301}b\x1b[D\x1b[D".as_bytes());
     // Removing the base before a combining mark must redraw the preceding glyph.
     let output = terminal.input(&[127]);

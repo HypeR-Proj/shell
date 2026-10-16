@@ -93,7 +93,7 @@ impl Renderer {
                 "\x08".repeat(cells)
             )
         } else {
-            // Absolute column positioning also cancels the terminal's pending
+            // Returning to column zero also cancels the terminal's pending
             // wrap at the right margin. Clear from the edit point through any
             // old wrapped rows, leaving the prompt and prefix untouched.
             let mut output = cursor_move(self.position, cursor);
@@ -155,7 +155,12 @@ fn cursor_move(from: Position, to: Position) -> String {
     } else if from.row < to.row {
         output.push_str(&format!("\x1b[{}B", to.row - from.row));
     }
-    output.push_str(&format!("\x1b[{}G", to.column + 1));
+    // Use VT100 cursor controls: minicom interprets CSI n G (CHA) as a
+    // return to column zero, ignoring n. CR also clears pending line wrap.
+    output.push('\r');
+    if to.column != 0 {
+        output.push_str(&format!("\x1b[{}C", to.column));
+    }
     output
 }
 
