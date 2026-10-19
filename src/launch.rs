@@ -38,6 +38,12 @@ pub(super) struct NativeBackend {
 
 impl Backend for NativeBackend {
     fn canonical_input(&mut self, enabled: bool) -> Result<(), String> {
+        // The pipeline's final consumer owns terminal control even when stdin
+        // is a pipe (for example cat | less). A read from that pipe must not
+        // reconfigure the shared lease and cancel an upstream terminal reader.
+        if !self.terminal_stdio[0] {
+            return Ok(());
+        }
         let Some(terminal) = self.authorities.terminal.as_mut() else {
             return Ok(());
         };
