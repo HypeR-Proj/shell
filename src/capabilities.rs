@@ -244,6 +244,19 @@ pub(super) fn prepare_command(
                 RightsOffer::Exact(Rights::INSPECT),
             )
             .map_err(|_| Error::InvalidCommand)?,
+        Some(Authority::Profiling) => {
+            builder
+                .add_handle_duplicate(
+                    authorities.cpu_inspector.as_handle_ref(),
+                    startup::CPU_INSPECTOR.as_raw(),
+                    RightsOffer::Exact(
+                        Rights::INSPECT
+                            .union(Rights::SET_ATTRIBUTES)
+                            .union(Rights::INSPECT_DETAILS),
+                    ),
+                )
+                .map_err(|_| Error::InvalidCommand)?;
+        }
         Some(Authority::Activity) => {
             builder
                 .add_handle_duplicate(

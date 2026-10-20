@@ -14,6 +14,7 @@ pub enum Authority {
     Handles,
     Memory,
     Activity,
+    Profiling,
     VirtualMachines,
 }
 
@@ -44,6 +45,7 @@ impl Program {
             "/bin/ps" => Some(Authority::Tasks),
             "/bin/handle" => Some(Authority::Handles),
             "/bin/free" | "/bin/memstat" => Some(Authority::Memory),
+            "/bin/perf" => Some(Authority::Profiling),
             "/bin/top" => Some(Authority::Activity),
             "/bin/vmm" => Some(Authority::VirtualMachines),
             _ => None,

@@ -53,6 +53,7 @@ fn private_authorities_follow_selected_trusted_paths_not_basenames() -> Result<(
         ("free", Authority::Memory),
         ("memstat", Authority::Memory),
         ("top", Authority::Activity),
+        ("perf", Authority::Profiling),
         ("vmm", Authority::VirtualMachines),
     ] {
         assert_eq!(Program::resolve(name, &cwd)?.authority, Some(authority));
