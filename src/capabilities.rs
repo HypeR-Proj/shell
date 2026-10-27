@@ -245,6 +245,23 @@ pub(super) fn prepare_command(
             )
             .map_err(|_| Error::InvalidCommand)?,
         Some(Authority::Profiling) => {
+            if let Some(connector) = authorities.vm_connection.as_ref()
+                && let Ok(observer) = connect_trace_observer(connector)
+            {
+                add_child_channel(
+                    &builder,
+                    observer,
+                    vm::TRACE_OBSERVER.as_raw(),
+                    Rights::WAIT.union(Rights::READ).union(Rights::WRITE),
+                )?;
+            }
+            builder
+                .add_handle_duplicate(
+                    authorities.task_inspector.as_handle_ref(),
+                    startup::TASK_INSPECTOR.as_raw(),
+                    RightsOffer::Exact(Rights::INSPECT),
+                )
+                .map_err(|_| Error::InvalidCommand)?;
             builder
                 .add_handle_duplicate(
                     authorities.cpu_inspector.as_handle_ref(),
@@ -310,6 +327,24 @@ pub(super) fn prepare_command(
     }
     child.error.add_to(&builder, StandardStream::Error)?;
     Ok(builder)
+}
+
+fn connect_trace_observer(
+    connector: &CapabilityChannel,
+) -> hyper_os::Result<OwnedHandle<ByteChannelObject>> {
+    let (client, server) = channel::create_pair()?;
+    let mut server = Some(server);
+    let deadline = hyper_os::time::deadline_after(std::time::Duration::from_millis(250))?.as_raw();
+    hyper_service::io::send_capabilities(
+        connector,
+        vm::trace::CONNECT,
+        &mut [CapabilityDisposition::move_handle(
+            &mut server,
+            RightsOffer::Exact(Rights::WAIT.union(Rights::READ).union(Rights::WRITE)),
+        )?],
+        deadline,
+    )?;
+    Ok(client)
 }
 
 fn connect_vm_manager(
