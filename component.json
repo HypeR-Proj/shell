@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "name": "shell",
+  "kind": "application",
+  "origin": {
+    "repository": "https://github.com/roolrz/HypeR",
+    "commit": "8d42d047058a2b58a291803700e86487fb723f7a"
+  },
+  "sources": {
+    "Cargo.toml": "app/shell/Cargo.toml",
+    "component.mk": "app/shell/component.mk",
+    "src/capabilities.rs": "app/shell/src/capabilities.rs",
+    "src/cli.rs": "app/shell/src/cli.rs",
+    "src/completion.rs": "app/shell/src/completion.rs",
+    "src/descriptor.rs": "app/shell/src/descriptor.rs",
+    "src/editor.rs": "app/shell/src/editor.rs",
+    "src/history.rs": "app/shell/src/history.rs",
+    "src/input.rs": "app/shell/src/input.rs",
+    "src/interactive.rs": "app/shell/src/interactive.rs",
+    "src/interpreter/arithmetic.rs": "app/shell/src/interpreter/arithmetic.rs",
+    "src/interpreter/builtin.rs": "app/shell/src/interpreter/builtin.rs",
+    "src/interpreter/evaluate.rs": "app/shell/src/interpreter/evaluate.rs",
+    "src/interpreter/expand.rs": "app/shell/src/interpreter/expand.rs",
+    "src/interpreter/format.rs": "app/shell/src/interpreter/format.rs",
+    "src/interpreter/io.rs": "app/shell/src/interpreter/io.rs",
+    "src/interpreter/mod.rs": "app/shell/src/interpreter/mod.rs",
+    "src/interpreter/pattern.rs": "app/shell/src/interpreter/pattern.rs",
+    "src/interpreter/read.rs": "app/shell/src/interpreter/read.rs",
+    "src/interpreter/state.rs": "app/shell/src/interpreter/state.rs",
+    "src/launch.rs": "app/shell/src/launch.rs",
+    "src/layout.rs": "app/shell/src/layout.rs",
+    "src/lib.rs": "app/shell/src/lib.rs",
+    "src/main.rs": "app/shell/src/main.rs",
+    "src/path.rs": "app/shell/src/path.rs",
+    "src/program.rs": "app/shell/src/program.rs",
+    "src/reactor.rs": "app/shell/src/reactor.rs",
+    "src/route.rs": "app/shell/src/route.rs",
+    "src/syntax/lexer.rs": "app/shell/src/syntax/lexer.rs",
+    "src/syntax/mod.rs": "app/shell/src/syntax/mod.rs",
+    "src/syntax/parser.rs": "app/shell/src/syntax/parser.rs",
+    "tests/cli.rs": "app/shell/tests/cli.rs",
+    "tests/completion.rs": "app/shell/tests/completion.rs",
+    "tests/editor.rs": "app/shell/tests/editor.rs",
+    "tests/history.rs": "app/shell/tests/history.rs",
+    "tests/interactive.rs": "app/shell/tests/interactive.rs",
+    "tests/interpreter.rs": "app/shell/tests/interpreter.rs",
+    "tests/path.rs": "app/shell/tests/path.rs",
+    "tests/program.rs": "app/shell/tests/program.rs"
+  },
+  "SPDX-FileCopyrightText": "2026 roolrz",
+  "SPDX-License-Identifier": "Apache-2.0",
+  "mounts": {
+    "": "app/shell"
+  },
+  "packages": [
+    "hyper-shell"
+  ],
+  "tests": [
+    [
+      "make",
+      "app-test",
+      "APP_TEST_PACKAGE=hyper-shell"
+    ]
+  ]
+}
