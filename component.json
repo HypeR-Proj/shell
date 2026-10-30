@@ -17,5 +17,63 @@
       "app-test",
       "APP_TEST_PACKAGE=hyper-shell"
     ]
-  ]
+  ],
+  "cargo": [
+    {
+      "manifest": "Cargo.toml",
+      "domain": "system"
+    }
+  ],
+  "artifacts": [
+    {
+      "binary": "hyper-shell",
+      "staged": "sh",
+      "destination": "bin/sh",
+      "mode": "0755",
+      "profiles": [
+        "development"
+      ],
+      "rust_runtime": "std",
+      "environment": "system",
+      "manifest": "Cargo.toml",
+      "enabled": true
+    }
+  ],
+  "build": {
+    "requires": [
+      "toolchain"
+    ],
+    "actions": {
+      "all": [
+        [
+          "python3",
+          "{workspace}/scripts/build-native-module.py",
+          "--module",
+          "{module}",
+          "--action",
+          "{action}"
+        ]
+      ],
+      "build": [
+        [
+          "python3",
+          "{workspace}/scripts/build-native-module.py",
+          "--module",
+          "{module}",
+          "--action",
+          "{action}"
+        ]
+      ],
+      "check": [
+        [
+          "python3",
+          "{workspace}/scripts/build-native-module.py",
+          "--module",
+          "{module}",
+          "--action",
+          "{action}"
+        ]
+      ]
+    }
+  }
 }

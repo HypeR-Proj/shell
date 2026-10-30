@@ -1,9 +1,0 @@
-# SPDX-FileCopyrightText: 2026 roolrz
-# SPDX-License-Identifier: Apache-2.0
-
-config SYSTEM_APP_SH
-    bool "sh (/bin/sh)"
-    default y
-    help
-        Build and deploy hyper-shell at /bin/sh.
-
