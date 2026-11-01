@@ -4,8 +4,6 @@
 //! Formal system shell. Bootstrap uses its separate byte-stream fallback shell.
 
 // Select the shared parser implementation for the formal environment.
-#[cfg(target_os = "hyper")]
-extern crate hyper_clap_shared as _;
 
 mod capabilities;
 mod descriptor;
@@ -491,3 +489,6 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(target_os = "hyper")]
+extern crate hyper_clap_shared as clap;

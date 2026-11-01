@@ -15,3 +15,6 @@ pub mod syntax;
 #[cfg(test)]
 #[path = "../tests/interpreter.rs"]
 mod interpreter_tests;
+
+#[cfg(target_os = "hyper")]
+extern crate hyper_clap_shared as clap;
