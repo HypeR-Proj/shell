@@ -13,11 +13,10 @@ publish = false
 autotests = false
 
 [dependencies]
-shlex = "=1.3.0"
-unicode-width = "=0.2.2"
+shlex = "1"
+unicode-width = "0.2"
 
 [dependencies.hyper-terminal]
-version = "=0.1.0"
 path = "../../lib/terminal"
 
 [dependencies.hyper-os]
@@ -83,7 +82,7 @@ features = ["derive"]
 [target."cfg(not(target_os = \"hyper\"))".dependencies]
 
 [target."cfg(not(target_os = \"hyper\"))".dependencies.clap]
-version = "=4.6.6"
+version = "4"
 features = ["derive"]
 
 [workspace]
