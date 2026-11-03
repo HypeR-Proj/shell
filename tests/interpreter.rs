@@ -50,13 +50,121 @@ fn nested_exec_keeps_extra_descriptors_without_leaking_temporary_stdout() -> Res
 }
 
 fn output(source: &str) -> Result<(String, i32), String> {
+    output_at(source, "/")
+}
+
+fn output_at(source: &str, cwd: &str) -> Result<(String, i32), String> {
     let bytes = Rc::new(RefCell::new(Vec::new()));
-    let mut shell = Shell::new(State::default(), NoProcesses);
+    let mut state = State {
+        cwd: cwd.into(),
+        ..State::default()
+    };
+    state.set("PWD", cwd.into())?;
+    let mut shell = Shell::new(state, NoProcesses);
     shell.streams.set(1, Port::Capture(bytes.clone()));
     shell.streams.set(2, Port::Capture(bytes.clone()));
     let status = shell.execute(source)?;
     let result = String::from_utf8(bytes.borrow().clone()).map_err(|e| e.to_string())?;
     Ok((result, status))
+}
+
+#[test]
+#[cfg(unix)]
+fn redirects_follow_symlinks_before_parent_components() -> Result<(), String> {
+    struct Fixture(std::path::PathBuf);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let path = std::env::temp_dir().join(format!("hyper-shell-symlinks-{}", std::process::id()));
+    std::fs::create_dir(&path).map_err(|e| e.to_string())?;
+    let fixture = Fixture(path);
+    let logical = fixture.0.join("logical");
+    let physical = fixture.0.join("physical");
+    std::fs::create_dir(&logical).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(physical.join("child")).map_err(|e| e.to_string())?;
+    std::os::unix::fs::symlink(physical.join("child"), logical.join("link"))
+        .map_err(|e| e.to_string())?;
+    std::fs::write(logical.join("value"), "untouched\n").map_err(|e| e.to_string())?;
+    let cwd = logical.to_str().ok_or("non-UTF-8 test directory")?;
+    for (index, prefix) in ["link/..".to_owned(), format!("{cwd}/link/..")]
+        .iter()
+        .enumerate()
+    {
+        std::fs::write(physical.join("value"), "physical\n").map_err(|e| e.to_string())?;
+        assert_eq!(
+            output_at(
+                &format!("read -r value <'{prefix}/value'; echo \"$value\""),
+                cwd
+            )?,
+            ("physical\n".into(), 0)
+        );
+        assert_eq!(
+            output_at(
+                &format!(
+                    "echo replaced >'{prefix}/value'; echo appended >>'{prefix}/value'; echo created >'{prefix}/new-{index}'"
+                ),
+                cwd,
+            )?,
+            (String::new(), 0)
+        );
+        assert_eq!(
+            std::fs::read_to_string(physical.join("value")).map_err(|e| e.to_string())?,
+            "replaced\nappended\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(physical.join(format!("new-{index}")))
+                .map_err(|e| e.to_string())?,
+            "created\n"
+        );
+        assert!(!logical.join(format!("new-{index}")).exists());
+        assert_eq!(
+            std::fs::read_to_string(logical.join("value")).map_err(|e| e.to_string())?,
+            "untouched\n"
+        );
+    }
+    assert_eq!(output_at("cd link/..; pwd", cwd)?, (format!("{cwd}\n"), 0));
+    Ok(())
+}
+
+#[test]
+fn unquoted_positional_arguments_split_individually() -> Result<(), String> {
+    for source in [
+        "IFS=:; set -- a b; printf '<%s>\\n' $@",
+        "IFS=:; set -- 'a:b' 'c::d:'; printf '<%s>\\n' ${@}",
+        "IFS=:; set -- '' a ''; printf '<%s>\\n' pre$@post",
+        "IFS=:; set -- '' '' a ''; printf '<%s>\\n' $@",
+        "IFS=; set -- 'a b' c ''; printf '<%s>\\n' $@",
+        "IFS=' :'; set -- ' a : b ' ' c:d '; printf '<%s>\\n' pre$@post",
+        "set -- ' a b ' 'c d'; printf '<%s>\\n' pre$@post",
+        "set --; f() { echo $#; }; f $@; f ''$@; f pre$@post",
+        "IFS=:; set -- 'a:b' 'c:d'; printf '<%s>\\n' \"$@\"",
+        "IFS=:; set -- a b; printf '<%s>\\n' $@$@",
+    ] {
+        let expected = std::process::Command::new("/bin/bash")
+            .args(["--noprofile", "--norc", "-c", source])
+            .output()
+            .map_err(|e| e.to_string())?;
+        let (actual, status) = output(source)?;
+        assert_eq!(
+            actual,
+            String::from_utf8_lossy(&expected.stdout),
+            "{source}"
+        );
+        assert_eq!(status, expected.status.code().unwrap_or(-1), "{source}");
+    }
+    Ok(())
+}
+
+#[test]
+fn arithmetic_leading_zeroes_are_decimal() -> Result<(), String> {
+    // This is an intentional difference from Bash's leading-zero octal syntax.
+    assert_eq!(
+        output("x=010; echo $((010)) $((08)) $((09)) $((x + 1)) $((0x10)) $((0Xf)) $((-010))")?,
+        ("10 8 9 11 16 15 -10\n".into(), 0)
+    );
+    Ok(())
 }
 
 #[test]

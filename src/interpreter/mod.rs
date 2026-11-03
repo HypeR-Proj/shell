@@ -81,11 +81,16 @@ fn assignment(word: &str) -> Option<(&str, &str)> {
 }
 
 fn absolute(cwd: &str, path: &str) -> String {
-    let joined = if path.starts_with('/') {
+    // Filesystem traversal must resolve symlinks before subsequent .. components.
+    if path.starts_with('/') {
         path.to_owned()
     } else {
         format!("{cwd}/{path}")
-    };
+    }
+}
+
+fn logical_directory(cwd: &str, path: &str) -> String {
+    let joined = absolute(cwd, path);
     let mut parts = Vec::new();
     for part in joined.split('/') {
         match part {

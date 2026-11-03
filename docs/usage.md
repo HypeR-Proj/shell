@@ -105,10 +105,17 @@ for file in /tmp/*.txt; do report "$file"; done
 Assignments, `export`, `readonly`, `unset`, `shift` and `set --` manage shell
 state. Single quotes are literal; double quotes permit expansion without field
 splitting or pathname expansion. Unquoted substitutions are split by `IFS` and
-then globbed. `*`, `?` and bracket patterns are supported; unmatched pathname
+then globbed. Unquoted `$@` and `${@}` separate positional values with the first
+`IFS` character before splitting, preserving non-whitespace delimiter semantics
+for empty fields. With empty `IFS`, values remain separate without splitting.
+Prefixes and suffixes attach to the first and last positional values.
+`*`, `?` and bracket patterns are supported; unmatched pathname
 patterns remain literal. Dotfiles require an explicit leading dot. `$(...)`
 captures stdout and removes trailing newlines. `$((...))` provides integer
-arithmetic, comparisons, bitwise and logical operators. Parameter expansion
+arithmetic, comparisons, bitwise and logical operators. Arithmetic integers are
+decimal, including leading-zero forms (`010` is ten; `08` and `09` are valid).
+The `0x` and `0X` prefixes select hexadecimal. These rules also apply to numeric
+variable values; unlike Bash, leading zeroes do not select octal. Parameter expansion
 includes `${name:-default}`, `${name:=value}`, `${name:+alternate}`,
 `${name:?error}` and `${#name}`. The colon selects unset-or-empty rather than
 unset-only handling. Comments start with `#` at a word boundary.
@@ -163,7 +170,10 @@ and `2>&1 >file` have different destinations. Earlier file opens/truncations
 still occur when a later redirect replaces that stream. A file target must
 expand to exactly one word. Redirection also applies to builtins, functions and
 compound commands; it is restored after that command. `exec` without a command
-keeps redirections for subsequent shell commands.
+keeps redirections for subsequent shell commands. File targets use filesystem
+path resolution: in `link/../file`, the link is followed before `..` is resolved.
+This applies to existing files and newly created output files. The `cd` builtin
+retains its logical directory handling of `..`.
 
 Descriptors 0 through 63 are shell-local stream names. Native programs inherit
 the three standard streams; this does not introduce Unix fd numbers into the
