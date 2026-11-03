@@ -91,10 +91,24 @@ impl<B: Backend> Shell<B> {
                 let (values, next, positional) = self.dollar(word, at, io)?;
                 at = next;
                 let quoted = quote != 0 || !split;
-                if positional && quoted {
-                    // "$@" contributes separate arguments, while prefixes and
-                    // suffixes attach to its first and last positional values.
-                    if values.is_empty() && empty_positional_removable {
+                if positional
+                    && !quoted
+                    && let Some(separator) = self.state.get("IFS").unwrap_or(" \t\n").chars().next()
+                {
+                    // Positional boundaries are IFS delimiters, including their
+                    // empty-field semantics when the separator is not whitespace.
+                    empty_positional_removable = false;
+                    split_append(
+                        &mut fields,
+                        &values.join(&separator.to_string()),
+                        self.state.get("IFS").unwrap_or(" \t\n"),
+                    )?;
+                } else if positional {
+                    // Quoted $@ and unquoted $@ with empty IFS retain separate
+                    // fields. Prefixes/suffixes attach to the first/last value.
+                    if !quoted {
+                        empty_positional_removable = false;
+                    } else if values.is_empty() && empty_positional_removable {
                         let field = fields.last_mut().ok_or("empty expansion")?;
                         if field.text.is_empty() {
                             field.keep = false;
@@ -109,7 +123,7 @@ impl<B: Backend> Shell<B> {
                         fields
                             .last_mut()
                             .ok_or("empty expansion")?
-                            .append(value, true);
+                            .append(value, quoted);
                     }
                 } else {
                     empty_positional_removable = false;

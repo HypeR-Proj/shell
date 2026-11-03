@@ -211,7 +211,7 @@ impl<B: Backend> Shell<B> {
                 .map(String::as_str)
                 .unwrap_or_else(|| self.state.get("HOME").unwrap_or("/"))
         };
-        let target = self.state.path(target);
+        let target = super::logical_directory(&self.state.cwd, target);
         self.backend.directory(&target)?;
         let previous = self.state.cwd.clone();
         self.state.cwd = target.clone();
