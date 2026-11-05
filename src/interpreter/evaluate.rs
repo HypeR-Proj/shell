@@ -120,6 +120,10 @@ impl<B: Backend> Shell<B> {
                 vec![1]
             }
         };
+        let statuses = match self.flow {
+            Flow::Exit(code) | Flow::Return(code) => vec![code],
+            _ => statuses,
+        };
         let status = if self.state.pipefail {
             statuses.iter().rev().find(|s| **s != 0)
         } else {
@@ -128,7 +132,7 @@ impl<B: Backend> Shell<B> {
         .copied()
         .unwrap_or(0);
         self.state.pipeline_status = statuses;
-        self.state.status = if pipeline.negate {
+        self.state.status = if pipeline.negate && self.flow == Flow::None {
             i32::from(status == 0)
         } else {
             status
@@ -182,6 +186,11 @@ impl<B: Backend> Shell<B> {
         })
     }
     fn command(&mut self, command: &Command, io: &Streams) -> Result<i32> {
+        if self.backend.checkpoint()? {
+            self.state.status = 130;
+            self.flow = Flow::Exit(130);
+            return Ok(130);
+        }
         if let CommandKind::Function { name, body } = &command.kind {
             self.state.functions.insert(name.clone(), (**body).clone());
             return Ok(0);
@@ -210,6 +219,14 @@ impl<B: Backend> Shell<B> {
         match result {
             Ok(status) => Ok(status),
             Err(error) => {
+                // A cancelled blocking operation reaches the same safe point
+                // as a request observed between commands, without an unrelated
+                // command-error diagnostic or a following command execution.
+                if self.backend.checkpoint()? {
+                    self.state.status = 130;
+                    self.flow = Flow::Exit(130);
+                    return Ok(130);
+                }
                 // A failing redirect observes all redirects already committed.
                 // A closed stderr cannot turn an ordinary command error into a
                 // fatal shell error or escape the selected diagnostic stream.

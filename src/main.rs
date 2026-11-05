@@ -6,8 +6,10 @@
 // Select the shared parser implementation for the formal environment.
 
 mod capabilities;
+mod control;
 mod descriptor;
 mod input;
+mod jobs;
 mod launch;
 mod reactor;
 mod route;
@@ -49,6 +51,15 @@ fn run(startup: &mut Startup<'_>, args: &hyper_shell::cli::Shell) -> Result<Exit
     let output = inherited_stream(StandardStream::Output)?;
     let error = inherited_stream(StandardStream::Error)?;
     let terminal = hyper_terminal::Terminal::take(startup)?;
+    let mut control = process::control::Client::take(startup)?;
+    if let Some(client) = control.as_mut() {
+        client.configure(
+            process::control::Disposition::Notify,
+            hyper_os::time::deadline_after(std::time::Duration::from_secs(30))?.as_raw(),
+        )?;
+    }
+    let inherited_job = process::job::Client::take(startup)?;
+    let inherited_broadcast = process::job::Broadcaster::take(startup)?;
     let root_directory = startup.take_root_directory().map_err(Error::from)?;
     let environment = Directory::from_handle(
         startup
@@ -141,6 +152,14 @@ fn run(startup: &mut Startup<'_>, args: &hyper_shell::cli::Shell) -> Result<Exit
                 std::io::stderr().is_terminal(),
             ],
             read_settings: None,
+            control,
+            inherited_job,
+            jobs: Vec::new(),
+            exit_requested: false,
+            cancel_requested: false,
+            input_buffer: std::collections::VecDeque::new(),
+            pipe_scratch: Vec::new(),
+            inherited_broadcast,
         },
     );
     shell
@@ -188,7 +207,11 @@ fn run(startup: &mut Startup<'_>, args: &hyper_shell::cli::Shell) -> Result<Exit
                 );
             }
         }
-        let status = shell.worker(worker).map_err(Error::Message)?;
+        let result = shell.worker(worker);
+        if shell.backend.exit_requested || shell.backend.cancel_requested {
+            return Ok(exit_code(130));
+        }
+        let status = result.map_err(Error::Message)?;
         return Ok(exit_code(match shell.flow {
             Flow::Exit(code) => code,
             _ => status,
@@ -213,16 +236,28 @@ fn run(startup: &mut Startup<'_>, args: &hyper_shell::cli::Shell) -> Result<Exit
         return run_script(&mut shell, &source, args.check);
     }
     if !interactive {
-        let mut source = String::new();
-        std::io::stdin()
-            .take(hyper_shell::syntax::MAX_SCRIPT_BYTES as u64 + 1)
-            .read_to_string(&mut source)
-            .map_err(Error::Io)?;
+        let mut source = Vec::new();
+        let mut chunk = [0; 4096];
+        loop {
+            let Some(count) = shell.backend.read_standard(&mut chunk)? else {
+                return Ok(exit_code(130));
+            };
+            if count == 0 {
+                break;
+            }
+            source.extend_from_slice(&chunk[..count]);
+            if source.len() > hyper_shell::syntax::MAX_SCRIPT_BYTES {
+                return Err(Error::Message("shell script limit exceeded".into()));
+            }
+        }
+        let source = String::from_utf8(source)
+            .map_err(|_| Error::Message("shell script is not UTF-8".into()))?;
         return run_script(&mut shell, &source, args.check);
     }
     if let Some(terminal) = shell.backend.authorities.terminal.as_mut() {
         let mut settings = hyper_terminal::Settings::raw();
         settings.output.lf_to_crlf = true;
+        settings.signals = true;
         terminal.set_settings(settings)?;
     }
     interactive_shell(&mut shell)
@@ -275,7 +310,13 @@ fn run_script(
         hyper_shell::syntax::parse(source).map_err(|e| Error::Message(e.to_string()))?;
         return Ok(ExitCode::SUCCESS);
     }
-    let code = shell.execute(source).map_err(Error::Message)?;
+    let result = shell.execute(source);
+    // A notification can arrive during the final pipeline, with no following
+    // interpreter checkpoint. Preserve the shell's interruption convention.
+    if shell.backend.exit_requested || shell.backend.cancel_requested {
+        return Ok(exit_code(130));
+    }
+    let code = result.map_err(Error::Message)?;
     Ok(exit_code(match shell.flow {
         Flow::Exit(code) => code,
         _ => code,
@@ -301,7 +342,18 @@ fn interactive_shell(shell: &mut Shell<launch::NativeBackend>) -> Result<ExitCod
     write_terminal(b"\x1b[?2004h")?;
     let mut input_chunk = [0; INPUT_CHUNK_BYTES];
     loop {
-        let count = std::io::stdin().read(&mut input_chunk).map_err(Error::Io)?;
+        let Some(count) = shell.backend.read_standard(&mut input_chunk)? else {
+            if shell.backend.exit_requested {
+                return Ok(exit_code(130));
+            }
+            shell.backend.cancel_requested = false;
+            let _ = editor.push(3);
+            source.clear();
+            renderer.reset();
+            shell.state.status = 130;
+            write_terminal(b"^C\nhyper-sh$ ")?;
+            continue;
+        };
         if count == 0 {
             write_terminal(b"\x1b[?2004l")?;
             return Ok(exit_code(shell.state.status));
@@ -376,7 +428,10 @@ fn interactive_shell(shell: &mut Shell<launch::NativeBackend>) -> Result<ExitCod
                         Ok(_) => {
                             history.push(source.trim_end_matches('\n').to_owned());
                             shell.history = history.entries().to_vec();
-                            if let Err(error) = shell.execute(&source) {
+                            if let Err(error) = shell.execute(&source)
+                                && !shell.backend.exit_requested
+                                && !shell.backend.cancel_requested
+                            {
                                 shell.state.status = 2;
                                 write_terminal(format!("sh: {error}\n").as_bytes())?;
                             }
@@ -386,6 +441,14 @@ fn interactive_shell(shell: &mut Shell<launch::NativeBackend>) -> Result<ExitCod
                             // A missing or full /tmp never disables interactive history.
                             let _ = history.save();
                             editor.set_history(history.entries());
+                            if shell.backend.exit_requested {
+                                return Ok(exit_code(130));
+                            }
+                            if shell.backend.cancel_requested && !shell.backend.exit_requested {
+                                shell.backend.cancel_requested = false;
+                                shell.flow = Flow::None;
+                                shell.state.status = 130;
+                            }
                             if let Flow::Exit(code) = shell.flow {
                                 return Ok(exit_code(code));
                             }
