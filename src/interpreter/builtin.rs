@@ -39,7 +39,7 @@ impl<B: Backend> Shell<B> {
                 Ok(0)
             }
             "help" => {
-                io.write(1, "Native system shell\n\nCommands: pipelines, ;, &&, ||, !, if/elif/else, for, while, until, case, functions.\nExpansion: variables, positional arguments, $(commands), $((arithmetic)), wildcards.\nRedirection: < > >> <> >|, n>&m n<&m n>&-, << <<- <<<, &> &>>.\nBuiltins: cd pwd echo printf read test [ export readonly unset local set shift\n          source . eval exec return break continue exit true false history type help.\nEditing: arrows, Home/End, Delete, Ctrl-A/E/U/K/W/Y, Ctrl-R, Tab, Ctrl-L.\nStatus: $? is the last result; ${PIPESTATUS[@]} lists pipeline results.\nJobs and Linux signal semantics are not implemented.\n")?;
+                io.write(1, "Native system shell\n\nCommands: pipelines, ;, &&, ||, !, if/elif/else, for, while, until, case, functions.\nExpansion: variables, positional arguments, $(commands), $((arithmetic)), wildcards.\nRedirection: < > >> <> >|, n>&m n<&m n>&-, << <<- <<<, &> &>>.\nBuiltins: cd pwd echo printf read test [ export readonly unset local set shift\n          source . eval exec return break continue exit true false history type help.\nEditing: arrows, Home/End, Delete, Ctrl-A/E/U/K/W/Y, Ctrl-R, Tab, Ctrl-L.\nStatus: $? is the last result; ${PIPESTATUS[@]} lists pipeline results.\nCtrl-C requests termination of the foreground job; programs may handle or ignore it.\nPOSIX signals, suspension, and background job commands are not implemented.\n")?;
                 Ok(0)
             }
             "cd" => self.cd(args, io),

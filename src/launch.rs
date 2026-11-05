@@ -12,6 +12,7 @@ use hyper_os::handle::{
 };
 use hyper_os::startup;
 use hyper_os::task::ProcessTermination;
+use hyper_service::process::{control, job};
 use hyper_service::stdio::{Inherited, StandardStream};
 use hyper_shell::interpreter::io::Port;
 use hyper_shell::interpreter::{Backend, Invocation, Stage};
@@ -34,9 +35,32 @@ pub(super) struct NativeBackend {
     pub error: Inherited,
     pub terminal_stdio: [bool; 3],
     pub read_settings: Option<hyper_terminal::Settings>,
+    pub control: Option<control::Client>,
+    pub inherited_job: Option<job::Client>,
+    pub jobs: Vec<crate::jobs::Job>,
+    pub exit_requested: bool,
+    pub cancel_requested: bool,
+    pub input_buffer: std::collections::VecDeque<u8>,
+    pub pipe_scratch: Vec<u8>,
+    pub inherited_broadcast: Option<job::Broadcaster>,
 }
 
 impl Backend for NativeBackend {
+    fn checkpoint(&mut self) -> Result<bool, String> {
+        self.poll_control().map_err(|e| e.to_string())?;
+        Ok(self.exit_requested || self.cancel_requested)
+    }
+
+    fn read(&mut self, port: &Port, bytes: &mut [u8]) -> Result<usize, String> {
+        if matches!(port, Port::Standard(0)) {
+            self.read_standard(bytes)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "operation cancelled".into())
+        } else {
+            port.read(bytes)
+        }
+    }
+
     fn canonical_input(&mut self, enabled: bool) -> Result<(), String> {
         // The pipeline's final consumer owns terminal control even when stdin
         // is a pipe (for example cat | less). A read from that pipe must not
@@ -87,18 +111,48 @@ impl Backend for NativeBackend {
     fn pipeline(&mut self, stages: Vec<Stage>) -> Result<Vec<i32>, String> {
         let mut lease = None;
         let result = self.launch(stages, &mut lease);
+        // No launch-local registry index remains borrowed after launch returns.
+        let cleanup = self.collect_jobs();
         if let (Some(id), Some(terminal)) = (lease, self.authorities.terminal.as_mut()) {
             let cleanup = terminal.release_child(id);
             if result.is_ok() {
                 cleanup.map_err(|e| format!("terminal release: {e:?}"))?;
             }
         }
-        result.map_err(|e| e.to_string())
+        let result = result.map_err(|e| e.to_string())?;
+        cleanup.map_err(|e| e.to_string())?;
+        Ok(result)
     }
 }
 
 impl NativeBackend {
     fn launch(&mut self, stages: Vec<Stage>, lease: &mut Option<u64>) -> Result<Vec<i32>, Error> {
+        let root_job = if self.inherited_job.is_none() {
+            self.jobs.push(crate::jobs::Job::new()?);
+            Some(self.jobs.len() - 1)
+        } else {
+            None
+        };
+        let job_client = match root_job {
+            Some(index) => self.jobs[index].client()?,
+            None => self
+                .inherited_job
+                .as_ref()
+                .ok_or(Error::Protocol)?
+                .duplicate()?,
+        };
+        let mut broadcaster = match root_job {
+            Some(index) => self.jobs[index].broadcaster()?,
+            None => self
+                .inherited_broadcast
+                .as_ref()
+                .ok_or(Error::Protocol)?
+                .duplicate()?,
+        };
+        let mut job_events = None;
+        let mut controls = Vec::new();
+        let mut request_receivers = Vec::new();
+        let mut request_senders = Vec::new();
         let mut adapters = Adapters::default();
         let mut descriptors = Vec::new();
         let mut builders = Vec::new();
@@ -113,9 +167,10 @@ impl NativeBackend {
         let lease_owner = stages.len().checked_sub(1);
         let mut client = if !stages.is_empty() && self.authorities.terminal.is_some() {
             let terminal = self.authorities.terminal.as_mut().ok_or(Error::Protocol)?;
-            let client = terminal.prepare_child()?;
-            *lease = Some(client.id);
-            Some(client)
+            let prepared = terminal.prepare_job()?;
+            *lease = Some(prepared.client.id);
+            job_events = Some(prepared.events);
+            Some(prepared.client)
         } else {
             None
         };
@@ -218,6 +273,25 @@ impl NativeBackend {
                     terminal,
                 },
             )?;
+            let (supervisor, control_child) = control::prepare()?;
+            builder
+                .add_handle_move(
+                    control_child,
+                    control::STARTUP.as_raw(),
+                    RightsOffer::Exact(control::CHILD_RIGHTS),
+                )
+                .map_err(|e| e.error())?;
+            job_client.add_to(&builder)?;
+            if hyper_shell::program::Program::resolve(&arguments[0], &self.authorities.current_path)
+                .map_err(|_| Error::InvalidCommand)?
+                .is_shell()
+            {
+                broadcaster.add_to(&builder)?;
+            }
+            controls.push(supervisor);
+            let (receiver, sender) = job::Requests::create()?;
+            request_receivers.push(receiver);
+            request_senders.push(sender);
             if let Some(bytes) = payload {
                 let (parent, child) = channel::create_pair()?;
                 builder
@@ -250,20 +324,35 @@ impl NativeBackend {
         // would prevent downstream EOF and can deadlock a finite pipeline.
         drop(pipes);
         let mut running = Running(Vec::new());
-        for (index, builder) in builders.into_iter().enumerate() {
+        for (builder, sender) in builders.into_iter().zip(request_senders) {
             running.0.push(builder.start().map_err(|e| e.error())?);
-            if lease_owner == Some(index)
-                && let (Some(id), Some(terminal)) = (*lease, self.authorities.terminal.as_mut())
-            {
-                let process = running.0.last().ok_or(Error::Protocol)?;
-                terminal.bind_child(id, process.as_process_supervisor().observe()?)?;
+            let process = running.0.last().ok_or(Error::Protocol)?;
+            let observer = process.as_process_supervisor().observe()?;
+            match root_job {
+                Some(index) => self.jobs[index].registry.register(observer, sender)?,
+                None => job_client.register(observer, sender)?,
             }
+        }
+        if let (Some(id), Some(terminal)) = (*lease, self.authorities.terminal.as_mut()) {
+            let observer = running
+                .0
+                .last()
+                .ok_or(Error::Protocol)?
+                .as_process_supervisor()
+                .observe()?;
+            terminal.bind_job(id, observer)?;
         }
         relay_pipeline(
             &running.0,
             &mut adapters.routes,
             &mut descriptors,
             &mut adapters.inputs,
+            self,
+            &mut controls,
+            &mut request_receivers,
+            job_events.as_mut(),
+            &mut broadcaster,
+            root_job,
         )
     }
 
@@ -360,16 +449,83 @@ fn relay_pipeline(
     routes: &mut [route::Route],
     descriptors: &mut [crate::descriptor::Server],
     inputs: &mut [crate::input::Input],
+    backend: &mut NativeBackend,
+    controls: &mut [control::Supervisor],
+    requests: &mut [job::Requests],
+    mut job_events: Option<&mut hyper_terminal::JobEvents>,
+    broadcaster: &mut job::Broadcaster,
+    root_job: Option<usize>,
 ) -> Result<Vec<i32>, Error> {
     let mut terminated = vec![false; processes.len()];
     let mut first = 0;
+    let mut terminated_by_request = vec![false; processes.len()];
+    let mut termination_requested = vec![false; processes.len()];
+    let mut exit_forwarded = false;
     loop {
+        let mut progressed = backend.poll_control()?;
+        if backend.exit_requested && !exit_forwarded {
+            // Shell shutdown requests cleanup from its own children. This is
+            // shell policy, not recursive semantics of a process signal.
+            for control in controls.iter_mut() {
+                control.request_terminate();
+            }
+            termination_requested.fill(true);
+            exit_forwarded = true;
+        }
+        if let Some(events) = job_events.as_mut() {
+            for _ in 0..8 {
+                if events.try_receive()?.is_none() {
+                    break;
+                }
+                match root_job {
+                    Some(index) => backend.jobs[index].registry.request_terminate(),
+                    None => broadcaster.request_terminate(),
+                }
+                progressed = true;
+            }
+        }
+        progressed |= broadcaster.poll()?;
+        // Fan-out precedes any default action. No Process supervisor authority
+        // is transferred to the job registry, and no TaskGroup is stopped.
+        for job in &mut backend.jobs {
+            progressed |= job.poll()?;
+        }
+        for (index, ((control, request), process)) in controls
+            .iter_mut()
+            .zip(requests.iter_mut())
+            .zip(processes)
+            .enumerate()
+        {
+            if terminated[index] {
+                continue;
+            }
+            if request.poll()? {
+                control.request_terminate();
+                termination_requested[index] = true;
+                progressed = true;
+            }
+            match control.poll(0) {
+                Ok(Some(control::Dispatch::Default)) => {
+                    process.as_process_supervisor().request_stop()?;
+                    terminated_by_request[index] = true;
+                    progressed = true;
+                }
+                Ok(Some(control::Dispatch::Unavailable)) => {
+                    eprintln!("sh: child termination handler unavailable");
+                    progressed = true;
+                }
+                Ok(Some(_)) => progressed = true,
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("sh: child control: {error:?}");
+                }
+            }
+        }
         for (index, process) in processes.iter().enumerate() {
             if !terminated[index] {
                 terminated[index] = process.as_process_supervisor().info()?.terminal.is_some();
             }
         }
-        let mut progressed = false;
         for input in inputs.iter_mut() {
             if terminated[input.owner] {
                 input.finish();
@@ -402,13 +558,38 @@ fn relay_pipeline(
             progressed |= progress;
         }
         first = (first + 1) % routes.len().max(1);
-        if terminated.iter().all(|done| *done) && routes.iter().all(route::Route::finished) {
+        if terminated.iter().all(|done| *done)
+            && routes.iter().all(route::Route::finished)
+            && broadcaster.watch().is_none()
+        {
             break;
         }
         if progressed {
             continue;
         }
         let mut waits = Vec::new();
+        backend.control_waits(&mut waits);
+        if let Some((handle, signals)) = broadcaster.watch() {
+            waits.push(Source::Channel(handle, signals));
+        }
+        if let Some(events) = job_events.as_ref() {
+            waits.push(Source::Channel(
+                events.as_handle_ref(),
+                hyper_os::wait::ObjectSignals::<ByteChannelObject>::READABLE
+                    .union(hyper_os::wait::ObjectSignals::<ByteChannelObject>::PEER_CLOSED),
+            ));
+        }
+        for (index, (control, request)) in controls.iter().zip(requests.iter()).enumerate() {
+            if terminated[index] {
+                continue;
+            }
+            if let Some(handle) = control.as_handle_ref() {
+                waits.push(Source::Channel(handle, control.signals()));
+            }
+            if let Some((handle, signals)) = request.watch() {
+                waits.push(Source::Channel(handle, signals));
+            }
+        }
         for input in inputs.iter() {
             input.waits(&mut waits);
         }
@@ -431,14 +612,31 @@ fn relay_pipeline(
     }
     processes
         .iter()
-        .map(|process| {
+        .enumerate()
+        .map(|(index, process)| {
             let info = process.as_process_supervisor().info()?;
             Ok(match info.terminal {
                 Some(
                     ProcessTermination::ThreadExited { status }
                     | ProcessTermination::ProcessExited { status }
                     | ProcessTermination::LastThreadExited { status },
-                ) => (status & 255) as i32,
+                ) => {
+                    let status = (status & 255) as i32;
+                    // Shell supervisors report cooperative interruption as 130.
+                    // An ordinary exit 130 without a request does not interrupt
+                    // the caller's command list; other exit codes are unchanged.
+                    if status == 130 && termination_requested[index] {
+                        backend.cancel_requested = true;
+                    }
+                    status
+                }
+                Some(ProcessTermination::Requested) if terminated_by_request[index] => {
+                    // A foreground request is not itself shell cancellation:
+                    // Ignore and cooperative cleanup retain their exit status.
+                    // Only an applied default stop aborts the command list.
+                    backend.cancel_requested = true;
+                    130
+                }
                 _ => 125,
             })
         })

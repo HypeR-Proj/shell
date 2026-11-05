@@ -9,6 +9,7 @@ use io::Streams;
 impl<B: Backend> Shell<B> {
     pub(super) fn read(&mut self, args: &[String], io: &Streams) -> Result<i32> {
         let (mut raw, mut fd, mut at) = (false, 0, 0);
+        let mut prompt = None;
         while let Some(arg) = args.get(at) {
             match arg.as_str() {
                 "-r" => raw = true,
@@ -22,7 +23,7 @@ impl<B: Backend> Shell<B> {
                 }
                 "-p" => {
                     at += 1;
-                    io.write(2, args.get(at).ok_or("read: expected prompt")?)?;
+                    prompt = Some(args.get(at).ok_or("read: expected prompt")?);
                 }
                 "--" => {
                     at += 1;
@@ -39,13 +40,18 @@ impl<B: Backend> Shell<B> {
             self.backend.canonical_input(true)?;
         }
         let result = (|| -> Result<(Vec<u8>, Vec<bool>, bool)> {
+            // The prompt must not invite input until canonical settings are
+            // installed. Already processed raw bytes cannot be reinterpreted.
+            if let Some(prompt) = prompt {
+                io.write(2, prompt)?;
+            }
             let mut line = Vec::new();
             let mut protected = Vec::new();
             let mut eof = false;
             let mut escaped = false;
             loop {
                 let mut b = [0];
-                if io.get(fd).read(&mut b)? == 0 {
+                if self.backend.read(&io.get(fd), &mut b)? == 0 {
                     eof = true;
                     break;
                 }

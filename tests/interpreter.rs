@@ -7,6 +7,110 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 struct NoProcesses;
+
+#[test]
+fn read_prompt_is_published_only_after_canonical_mode_is_installed() -> Result<(), String> {
+    struct Input {
+        output: Rc<RefCell<Vec<u8>>>,
+        next: usize,
+    }
+    impl Backend for Input {
+        fn canonical_input(&mut self, enabled: bool) -> Result<(), String> {
+            if enabled && !self.output.borrow().is_empty() {
+                return Err("prompt was visible before canonical input".into());
+            }
+            Ok(())
+        }
+        fn read(&mut self, _: &Port, bytes: &mut [u8]) -> Result<usize, String> {
+            let Some(value) = b"Ada\n".get(self.next) else {
+                return Ok(0);
+            };
+            let byte = bytes.first_mut().ok_or("empty input request")?;
+            *byte = *value;
+            self.next += 1;
+            Ok(1)
+        }
+        fn directory(&mut self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn pipeline(&mut self, _: Vec<Stage>) -> Result<Vec<i32>, String> {
+            Err("unexpected process creation".into())
+        }
+    }
+    let output = Rc::new(RefCell::new(Vec::new()));
+    let mut shell = Shell::new(
+        State::default(),
+        Input {
+            output: output.clone(),
+            next: 0,
+        },
+    );
+    shell.streams.set(1, Port::Capture(output.clone()));
+    shell.streams.set(2, Port::Capture(output.clone()));
+    assert_eq!(shell.execute("read -p 'Name: ' name; echo $name")?, 0);
+    assert_eq!(&*output.borrow(), b"Name: Ada\n");
+    Ok(())
+}
+
+#[test]
+fn termination_safe_point_stops_builtin_loop_before_following_commands() -> Result<(), String> {
+    struct CancelAfter {
+        checks: usize,
+    }
+    impl Backend for CancelAfter {
+        fn checkpoint(&mut self) -> Result<bool, String> {
+            self.checks += 1;
+            Ok(self.checks >= 6)
+        }
+        fn directory(&mut self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn pipeline(&mut self, _: Vec<Stage>) -> Result<Vec<i32>, String> {
+            Err("unexpected process creation".into())
+        }
+    }
+    let bytes = Rc::new(RefCell::new(Vec::new()));
+    let mut shell = Shell::new(State::default(), CancelAfter { checks: 0 });
+    shell.streams.set(1, Port::Capture(bytes.clone()));
+    assert_eq!(
+        shell.execute("while true; do :; done; echo MUST_NOT_RUN")?,
+        130
+    );
+    assert_eq!(shell.flow, crate::interpreter::Flow::Exit(130));
+    assert!(bytes.borrow().is_empty());
+    Ok(())
+}
+
+#[test]
+fn cancelled_read_exits_without_error_diagnostic_or_following_command() -> Result<(), String> {
+    struct CancelRead {
+        requested: bool,
+    }
+    impl Backend for CancelRead {
+        fn checkpoint(&mut self) -> Result<bool, String> {
+            Ok(self.requested)
+        }
+        fn read(&mut self, _: &Port, _: &mut [u8]) -> Result<usize, String> {
+            self.requested = true;
+            Err("operation cancelled".into())
+        }
+        fn directory(&mut self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn pipeline(&mut self, _: Vec<Stage>) -> Result<Vec<i32>, String> {
+            Err("unexpected process creation".into())
+        }
+    }
+    let bytes = Rc::new(RefCell::new(Vec::new()));
+    let mut shell = Shell::new(State::default(), CancelRead { requested: false });
+    shell.streams.set(1, Port::Capture(bytes.clone()));
+    shell.streams.set(2, Port::Capture(bytes.clone()));
+    assert_eq!(shell.execute("read value; echo MUST_NOT_RUN")?, 130);
+    assert_eq!(shell.flow, crate::interpreter::Flow::Exit(130));
+    assert!(bytes.borrow().is_empty());
+    Ok(())
+}
+
 impl Backend for NoProcesses {
     fn directory(&mut self, _: &str) -> Result<(), String> {
         Ok(())

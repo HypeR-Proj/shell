@@ -53,6 +53,12 @@ pub struct Stage {
 }
 
 pub trait Backend {
+    fn checkpoint(&mut self) -> Result<bool> {
+        Ok(false)
+    }
+    fn read(&mut self, port: &io::Port, bytes: &mut [u8]) -> Result<usize> {
+        port.read(bytes)
+    }
     fn pipeline(&mut self, stages: Vec<Stage>) -> Result<Vec<i32>>;
     fn directory(&mut self, path: &str) -> Result<()>;
     fn canonical_input(&mut self, _enabled: bool) -> Result<()> {
