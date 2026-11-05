@@ -474,8 +474,17 @@ fn relay_pipeline(
         }
         if let Some(events) = job_events.as_mut() {
             for _ in 0..8 {
-                if events.try_receive()?.is_none() {
-                    break;
+                match events.try_receive() {
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(hyper_os::Error::Status(hyper_os::Status::PEER_CLOSED)) => {
+                        // Terminal failure closes both event paths. Disable
+                        // this wait without unwinding Running and stopping
+                        // children before their disconnected-I/O cleanup.
+                        job_events = None;
+                        break;
+                    }
+                    Err(error) => return Err(error.into()),
                 }
                 match root_job {
                     Some(index) => backend.jobs[index].registry.request_terminate(),

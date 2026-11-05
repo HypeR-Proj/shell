@@ -85,7 +85,10 @@ Foreground terminal leases belong to the supervising shell, not the pipeline's
 last consumer. Consumer exit restores presentation settings without revoking
 other members' access. Closing the job event endpoint or explicit release ends
 the lease. Events carry a lease identity and sequence, so stale job events cannot
-terminate a subsequent command. At the prompt Ctrl-C clears editing state. Shell
+terminate a subsequent command. Terminal-service failure closes the event paths
+without requesting termination: the shell continues supervising children while
+they observe disconnected streams and use the session's cleanup grace period.
+At the prompt Ctrl-C clears editing state. Shell
 builtin loops and standard-input reads service cooperative safe points; input
 cancellation collects the original read completion before releasing ownership.
 Filesystem operations and arbitrary blocking application calls are not made

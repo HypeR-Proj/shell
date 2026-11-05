@@ -49,8 +49,19 @@ impl NativeBackend {
         {
             match wait_many(&[wait], 0) {
                 Ok(_) => {
-                    if terminal.take_events()?.0 & hyper_terminal::EventFlags::TERMINATE != 0 {
-                        self.cancel_requested = true;
+                    match terminal.take_events() {
+                        Ok(events) => {
+                            if events.0 & hyper_terminal::EventFlags::TERMINATE != 0 {
+                                self.cancel_requested = true;
+                            }
+                        }
+                        Err(OsError::Status(Status::PEER_CLOSED)) => {
+                            // A lost terminal is not a termination request.
+                            // Keep supervising children while they observe
+                            // stream closure and use the session cleanup grace.
+                            self.authorities.terminal = None;
+                        }
+                        Err(error) => return Err(error.into()),
                     }
                     progressed = true;
                 }
