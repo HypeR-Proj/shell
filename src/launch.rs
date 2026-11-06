@@ -348,11 +348,13 @@ impl NativeBackend {
             &mut descriptors,
             &mut adapters.inputs,
             self,
-            &mut controls,
-            &mut request_receivers,
-            job_events.as_mut(),
-            &mut broadcaster,
-            root_job,
+            PipelineControl {
+                controls: &mut controls,
+                requests: &mut request_receivers,
+                job_events: job_events.as_mut(),
+                broadcaster: &mut broadcaster,
+                root_job,
+            },
         )
     }
 
@@ -444,18 +446,29 @@ impl Drop for Running {
     }
 }
 
+struct PipelineControl<'a> {
+    controls: &'a mut [control::Supervisor],
+    requests: &'a mut [job::Requests],
+    job_events: Option<&'a mut hyper_terminal::JobEvents>,
+    broadcaster: &'a mut job::Broadcaster,
+    root_job: Option<usize>,
+}
+
 fn relay_pipeline(
     processes: &[OwnedHandle<ProcessObject>],
     routes: &mut [route::Route],
     descriptors: &mut [crate::descriptor::Server],
     inputs: &mut [crate::input::Input],
     backend: &mut NativeBackend,
-    controls: &mut [control::Supervisor],
-    requests: &mut [job::Requests],
-    mut job_events: Option<&mut hyper_terminal::JobEvents>,
-    broadcaster: &mut job::Broadcaster,
-    root_job: Option<usize>,
+    control: PipelineControl<'_>,
 ) -> Result<Vec<i32>, Error> {
+    let PipelineControl {
+        controls,
+        requests,
+        mut job_events,
+        broadcaster,
+        root_job,
+    } = control;
     let mut terminated = vec![false; processes.len()];
     let mut first = 0;
     let mut terminated_by_request = vec![false; processes.len()];
