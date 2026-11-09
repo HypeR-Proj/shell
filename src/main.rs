@@ -100,10 +100,12 @@ fn run(startup: &mut Startup<'_>, args: &hyper_shell::cli::Shell) -> Result<Exit
     let services = startup.take_optional(hyper_component::OBSERVE)?;
     let service_control = startup.take_optional(hyper_component::CONTROL)?;
     let journal = startup.take_optional(hyper_journal::QUERY)?;
+    let random = startup.take_optional(hyper_service::random::CLIENT)?;
     let authorities = CommandAuthorities {
         services,
         service_control,
         journal,
+        random,
         root_directory,
         environment,
         current_directory,
@@ -494,6 +496,7 @@ struct CommandAuthorities {
     services: Option<OwnedHandle<hyper_os::handle::CapabilityChannelObject>>,
     service_control: Option<OwnedHandle<hyper_os::handle::CapabilityChannelObject>>,
     journal: Option<OwnedHandle<hyper_os::handle::CapabilityChannelObject>>,
+    random: Option<OwnedHandle<CapabilityChannelObject>>,
     root_directory: Directory,
     environment: Directory,
     current_directory: Directory,

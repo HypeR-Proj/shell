@@ -51,6 +51,15 @@ pub(super) fn prepare_command(
         loader.as_handle_ref(),
     )
     .map_err(Error::from)?;
+    // All commands, including nested shells, may use and explicitly delegate
+    // initialized random bytes. No provider-side read authority is inherited.
+    if let Some(random) = &authorities.random {
+        builder.add_handle_duplicate(
+            random.as_handle_ref(),
+            hyper_service::random::CLIENT.as_raw(),
+            RightsOffer::Exact(hyper_service::random::DELEGATED_CLIENT_RIGHTS),
+        )?;
+    }
     if program.is_shell() {
         process::ShellDelegation {
             environment: authorities.environment.as_handle_ref(),
